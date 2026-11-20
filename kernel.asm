@@ -60,9 +60,10 @@ start:
     sti
     cld
     mov di, bss_start
-    mov cx, 0x0800
+    mov cx, 0x1000
     xor al, al
     rep stosb
+    mov byte [con_attr], 0x07
     mov [bdrive], dl
     mov word [spt], 18
     mov word [heads], 2
@@ -84,61 +85,14 @@ start:
     mov [boot_t], dx
     mov [boot_t+2], cx
     mov [seed], dx
-    mov ax, 0x0003
-    int 0x10
-
-    ; ---- Boot log в стиле Linux (про SpheraOS) ----
-    mov bx, boot_log_table
-.bl:
-    mov si, [bx]
-    test si, si
-    jz .bl_done
-    call PrintSlow
-    add bx, 2
-    jmp .bl
-.bl_done:
-
+    call ClearScreen
     mov si, msg_banner
     call Print
-
-    call MountDrive
-    jnc .mok
-    mov si, msg_nomount
-    call Print
-    jmp shell
-.mok:
-    call LoadRoot
-    jc near shell
-    mov si, auto_name
-    call FindEntry
-    jc near shell
-    mov si, auto_cmd
-    mov di, cmdbuf
-    call CopyStr
-    mov si, cmdbuf
-    call ShellBuiltin
-    jmp shell
+    jmp boot_main
 
 ; ------------------------------------------------------------
 ; Console
 ; ------------------------------------------------------------
-PutC:                           ; AL = char (LF -> CR LF)
-    push ax
-    push bx
-    cmp al, 0x0A
-    jne .raw
-    mov ax, 0x0E0D
-    mov bx, 0x0007
-    int 0x10
-    mov al, 0x0A
-.raw:
-    mov ah, 0x0E
-    mov bx, 0x0007
-    int 0x10
-    pop bx
-    pop ax
-    ret
-
 Print:                          ; DS:SI asciiz
     push ax
     push si
@@ -151,28 +105,6 @@ Print:                          ; DS:SI asciiz
     jmp .l
 .d:
     pop si
-    pop ax
-    ret
-
-; PrintSlow: печатает строку с небольшой задержкой, чтобы boot выглядел как загрузка
-PrintSlow:
-    push ax
-    push cx
-    push dx
-    push si
-    call Print
-    mov cx, 36
-.delay:
-    in al, 0x40             ; ждём смены младшего байта счётчика PIT
-    mov ah, al
-.wait:
-    in al, 0x40
-    cmp al, ah
-    je .wait
-    loop .delay
-    pop si
-    pop dx
-    pop cx
     pop ax
     ret
 
@@ -433,7 +365,7 @@ ReadLine:                       ; -> inbuf ; CF=1 if Ctrl+C
     cmp al, 8
     je .bs
     cmp al, 3
-    je .cc
+    je near .cc
     test al, al
     jnz .chr
     cmp ah, 0x48
@@ -447,6 +379,10 @@ ReadLine:                       ; -> inbuf ; CF=1 if Ctrl+C
     mov [di], al
     inc di
     inc cx
+    cmp byte [rl_hide], 0
+    je .echo
+    mov al, '*'
+.echo:
     call PutC
     jmp .key
 .bs:
@@ -465,6 +401,8 @@ ReadLine:                       ; -> inbuf ; CF=1 if Ctrl+C
     call PutC
     ret
 .hist:
+    cmp byte [rl_hide], 0
+    jne .key
     test cx, cx
     jz .hcopy
     call .erase1
@@ -485,6 +423,8 @@ ReadLine:                       ; -> inbuf ; CF=1 if Ctrl+C
     mov byte [di], 0
     test cx, cx
     jz .nh
+    cmp byte [rl_hide], 0
+    jne .nh
     mov si, inbuf
     mov di, hist
     call CopyStr
@@ -518,37 +458,6 @@ DiskIO:
     push cx
     push dx
     push si
-    add ax, [part_base]             ; смещение раздела MBR
-    mov [io_lba], ax
-
-    ; --- Сначала LBA (int 13h AH=42/43) — надёжно для флешек и больших дисков ---
-    mov byte [dap], 0x10
-    mov byte [dap+1], 0
-    mov word [dap_lba], ax
-    mov word [dap_lba+2], 0
-    mov word [dap_lba+4], 0
-    mov word [dap_lba+6], 0
-    mov word [dap_off], bx
-    mov word [dap_cnt], 1
-    mov word [dap_seg], es          ; буфер может быть в сегменте ЗАДАЧИ, не в KSEG!
-    mov si, dap
-    mov dl, [bdrive]
-    mov ah, [dop]
-    cmp ah, 2
-    je .lbra
-    mov ah, 0x43
-    jmp .lbgo
-.lbra:
-    mov ah, 0x42
-.lbgo:
-    push ds                         ; BIOS int 13h может портить DS/ES
-    push es
-    int 0x13
-    pop es
-    pop ds
-    jnc .ok
-    ; --- Fallback: старый CHS-путь ---
-    mov ax, [io_lba]
     mov si, 5
 .try:
     push ax
@@ -565,20 +474,12 @@ DiskIO:
     mov dl, [bdrive]
     mov ah, [dop]
     mov al, 1
-    push ds                         ; снова сохраняем сегменты
-    push es
     int 0x13
-    pop es
-    pop ds
     pop ax
     jnc .ok
     push ax
     xor ax, ax
-    push ds
-    push es
     int 0x13
-    pop es
-    pop ds
     pop ax
     dec si
     jnz .try
@@ -620,35 +521,12 @@ MountDrive:
     push dx
     mov byte [dir_ok], 0
     mov byte [fat_ok], 0
-    mov word [part_base], 0
     xor ax, ax
     mov bx, secbuf
     call RdK
     jc near .fail
     cmp word [secbuf+510], 0xAA55
     jne near .fail
-    ; MBR: попробовать первый раздел типа FAT12 (0x01)
-    cmp byte [secbuf+0x1BE+4], 0x01
-    jne .no_part
-    mov ax, [secbuf+0x1BE+8]
-    test ax, ax
-    jz .no_part
-    mov [part_base], ax
-    xor ax, ax
-    mov bx, secbuf
-    call RdK
-    jc .bad_part
-    cmp word [secbuf+510], 0xAA55
-    jne .bad_part
-    cmp word [secbuf+11], 512
-    je .no_part
-.bad_part:
-    mov word [part_base], 0
-    xor ax, ax
-    mov bx, secbuf
-    call RdK
-    jc near .fail
-.no_part:
     cmp word [secbuf+11], 512
     jne near .fail
     xor ah, ah
@@ -674,7 +552,7 @@ MountDrive:
     mov [totsec], ax
     mov ax, [secbuf+22]
     mov [spf], ax
-    cmp ax, 12
+    cmp ax, 9
     ja .fail
     test ax, ax
     jz .fail
@@ -713,58 +591,6 @@ MountDrive:
     stc
 .out:
     pop dx
-    pop cx
-    pop bx
-    pop ax
-    ret
-
-LoadRoot:
-    cmp byte [dir_ok], 0
-    je .go
-    clc
-    ret
-.go:
-    push ax
-    push bx
-    push cx
-    mov ax, [root_start]
-    mov bx, dirbuf
-    mov cx, [root_secs]
-.l:
-    call RdK
-    jc .err
-    inc ax
-    add bx, 512
-    loop .l
-    mov byte [dir_ok], 1
-    clc
-    jmp .out
-.err:
-    stc
-.out:
-    pop cx
-    pop bx
-    pop ax
-    ret
-
-SaveRoot:
-    push ax
-    push bx
-    push cx
-    mov ax, [root_start]
-    mov bx, dirbuf
-    mov cx, [root_secs]
-.l:
-    call WrK
-    jc .err
-    inc ax
-    add bx, 512
-    loop .l
-    clc
-    jmp .out
-.err:
-    stc
-.out:
     pop cx
     pop bx
     pop ax
@@ -967,7 +793,7 @@ FindEntry:                      ; SI = name83 -> DI = entry, CF=1 if none
     call LoadRoot
     jc .out
     mov bx, dirbuf
-    mov cx, [rootent]
+    mov cx, [dir_ents]
 .e:
     mov al, [bx]
     test al, al
@@ -999,7 +825,7 @@ FindFree:                       ; -> DI = free slot, CF=1 if dir full
     call LoadRoot
     jc .out
     mov bx, dirbuf
-    mov cx, [rootent]
+    mov cx, [dir_ents]
 .l:
     mov al, [bx]
     test al, al
@@ -1047,6 +873,10 @@ To83:                           ; DS:SI text -> DI (11 bytes); CF=1 if no token
     jz .done
     cmp al, ' '
     je .done
+    cmp al, '/'
+    je .done
+    cmp al, 0x5C
+    je .done
     cmp al, '.'
     je .dot
     inc si
@@ -1066,6 +896,10 @@ To83:                           ; DS:SI text -> DI (11 bytes); CF=1 if no token
     test al, al
     jz .done
     cmp al, ' '
+    je .done
+    cmp al, '/'
+    je .done
+    cmp al, 0x5C
     je .done
     inc si
     test cx, cx
@@ -1173,6 +1007,8 @@ SaveFile:                       ; SI=name83, DX=size, data at [xfer_seg:xfer_off
     loop .cn
     jmp .init
 .have:
+    test byte [di+11], 0x10
+    jnz near .isdir
     mov ax, [di+26]
     call FreeChain
 .init:
@@ -1255,6 +1091,9 @@ SaveFile:                       ; SI=name83, DX=size, data at [xfer_seg:xfer_off
 .dirfull:
     mov si, msg_dirfull
     jmp .fail
+.isdir:
+    mov si, msg_isdir
+    jmp .fail
 .ioerr:
     mov si, msg_diskerr
 .fail:
@@ -1291,19 +1130,7 @@ shell:
     pop es
     cld
     sti
-    mov al, [bdrive]
-    mov bl, 'A'
-    test al, al
-    jz .pl
-    mov bl, 'B'
-    cmp al, 1
-    je .pl
-    mov bl, 'C'
-.pl:
-    mov al, bl
-    call PutC
-    mov si, msg_prompt
-    call Print
+    call PrintPrompt
     call ReadLine
     jc shell
     mov si, inbuf
@@ -1418,82 +1245,11 @@ cmd_help:
     call Print
     ret
 
-cmd_ls:
-    call LoadRoot
-    jc disk_err
-    call LoadFAT
-    jc disk_err
-    xor ax, ax
-    mov [ls_files], ax
-    mov [ls_bytes], ax
-    mov [ls_bytes+2], ax
-    mov byte [ls_col], 0    ; Сброс счетчика колонок
-    mov bx, dirbuf
-    mov cx, [rootent]
-.l:
-    mov al, [bx]
-    test al, al
-    jz .done
-    cmp al, 0xE5
-    je .next
-    test byte [bx+11], 0x08
-    jnz .next
-    
-    ; Печатаем имя (PrintName83 сам добивает пробелами до 14 символов)
-    mov si, bx
-    call PrintName83
-    
-    ; Проверяем, папка это или файл
-    test byte [bx+11], 0x10
-    jz .file
-    
-    ; Если это папка, просто идем дальше (чтобы не сбить колонки)
-    jmp .count_col
-.file:
-    ; Считаем статистику для файлов
-    inc word [ls_files]
-    mov ax, [bx+28]
-    mov dx, [bx+30]
-    add [ls_bytes], ax
-    adc [ls_bytes+2], dx
-.count_col:
-    inc byte [ls_col]
-    cmp byte [ls_col], 5    ; 5 колонок по 14 символов = 70 (влезает в 80)
-    jb .next
-    call PrintNL            ; Переход на новую строку
-    mov byte [ls_col], 0    ; Сброс счетчика
-.next:
-    add bx, 32
-    loop .l
-.done:
-    ; Если в последней строке остались элементы, делаем перенос
-    cmp byte [ls_col], 0
-    je .summary
-    call PrintNL
-.summary:
-    ; Вывод итоговой статистики (как было)
-    mov ax, [ls_files]
-    call PrintDec
-    mov si, msg_files
-    call Print
-    mov ax, [ls_bytes]
-    mov dx, [ls_bytes+2]
-    call PrintDec32
-    mov si, msg_bytes
-    call Print
-    call CountFree
-    mul word [cluster_bytes]
-    mov cx, 1024
-    call Div32by16
-    call PrintDec32
-    mov si, msg_kbfree
-    call Print
-    ret
-
 cmd_cat:
     mov di, fn83
-    call To83
-    jc near need_arg
+    call GetPath
+    jc near path_fail
+    mov [dir_want], ax
     mov si, fn83
     call FindEntry
     jc near not_found
@@ -1528,91 +1284,11 @@ cmd_cat:
 .r:
     ret
 
-cmd_cp:
-    mov di, fn83
-    call To83
-    jc .usage
-    mov di, fn83b
-    call To83
-    jc .usage
-    mov si, fn83
-    call FindEntry
-    jc near not_found
-    mov ax, SCRATCH
-    mov [xfer_seg], ax
-    mov word [xfer_off], 0
-    mov word [xfer_max], 0xF000
-    call LoadFile
-    jc near disk_err
-    mov dx, ax
-    mov si, fn83b
-    call SaveFile
-    ret
-.usage:
-    mov si, msg_use_cp
-    call Print
-    ret
-
-cmd_mv:
-    mov di, fn83
-    call To83
-    jc .usage
-    mov di, fn83b
-    call To83
-    jc .usage
-    mov si, fn83b
-    call FindEntry
-    jnc .exists
-    mov si, fn83
-    call FindEntry
-    jc near not_found
-    mov si, fn83b
-    mov bx, di
-    mov cx, 11
-.c:
-    mov al, [si]
-    mov [bx], al
-    inc si
-    inc bx
-    loop .c
-    call SaveRoot
-    jc near disk_err
-    ret
-.exists:
-    mov si, msg_exists
-    call Print
-    ret
-.usage:
-    mov si, msg_use_mv
-    call Print
-    ret
-
-cmd_rm:
-    mov di, fn83
-    call To83
-    jc near need_arg
-    mov si, fn83
-    call DeleteFile
-    jc near not_found
-    ret
-
-cmd_touch:
-    mov di, fn83
-    call To83
-    jc near need_arg
-    mov si, fn83
-    call FindEntry
-    jnc .r
-    xor dx, dx
-    mov si, fn83
-    call SaveFile
-.r:
-    ret
-
 cmd_hd:
     mov di, fn83
-    call To83
-    jc near need_arg
+    call GetPath
+    jc near path_fail
+    mov [dir_want], ax
     mov si, fn83
     call FindEntry
     jc near not_found
@@ -1699,8 +1375,11 @@ HexDump:                        ; [hd_seg]:SI, CX bytes (mult of 16)
 
 cmd_run:
     mov di, fn83
-    call To83
-    jc near need_arg
+    call GetPath
+    jc near path_fail
+    mov [dir_want], ax
+    call CheckRun
+    jc near nop_ret
     mov si, fn83
     call FindEntry
     jc near not_found
@@ -1718,6 +1397,8 @@ cmd_run:
     mov ax, KSEG
     mov ds, ax
     pop es
+    call ClearScreen
+    call ApplyColor
     ret
 
 ; ------------------------------------------------------------
@@ -1825,76 +1506,9 @@ cmd_disk:
     call PrintNL
     ret
 
-cmd_drives:
-    mov si, msg_drives
-    call Print
-    mov byte [scan_drv], 0
-.scan:
-    mov dl, [scan_drv]
-    push ds
-    pop es
-    mov bx, secbuf
-    mov ah, 0x08
-    int 0x13
-    jc .next
-    mov [scan_cx], cx
-    mov [scan_dx], dx
-    mov si, msg_drvnum
-    call Print
-    mov al, [scan_drv]
-    call PrintHexB
-    cmp byte [scan_drv], 0x80
-    jb .floppy
-    mov si, msg_hdd
-    jmp .type
-.floppy:
-    mov si, msg_floppy
-.type:
-    call Print
-    mov si, msg_d_spt
-    call Print
-    mov ax, [scan_cx]
-    and ax, 0x003F
-    call PrintLn
-    mov si, msg_d_heads
-    call Print
-    mov ax, [scan_dx]
-    mov al, ah
-    xor ah, ah
-    inc ax
-    call PrintLn
-.next:
-    inc byte [scan_drv]
-    jnz .scan
-    ret
-
 cmd_drive:
     cmp byte [si], 0
     je .show
-    ; числовой BIOS-привод: "drive 81" (hex) или "drive 129" (dec via 'd')
-    mov al, [si]
-    cmp al, '0'
-    jb .letter
-    cmp al, '9'
-    ja .letter
-    call ParseNumber                ; "0x81" -> 0x81
-    mov [new_drv], al
-    mov al, [bdrive]
-    mov [old_drv], al
-    mov al, [new_drv]
-    mov [bdrive], al
-    call MountDrive
-    jc .badnum
-    call LoadRoot
-    ret
-.badnum:
-    mov al, [old_drv]
-    mov [bdrive], al
-    call MountDrive
-    mov si, msg_mountfail
-    call Print
-    ret
-.letter:
     mov al, [si]
     or al, 0x20
     mov bl, 0
@@ -1923,7 +1537,6 @@ cmd_drive:
     ret
 .ok:
     pop ax
-    call LoadRoot
 .show:
     mov si, msg_curdrive
     call Print
@@ -1931,291 +1544,6 @@ cmd_drive:
     call PutC
     mov al, ':'
     call PutC
-    call PrintNL
-    ret
-
-cmd_format:
-    ; ищем цифру в аргументе ("0x81") — полное форматирование привода
-    mov di, si
-    mov cx, 12
-.scan:
-    mov al, [di]
-    cmp al, '0'
-    jb .nx
-    cmp al, '9'
-    ja .nx
-    mov si, di
-    jmp cmd_fmt_full
-.nx:
-    inc di
-    loop .scan
-.quick:
-    mov byte [fmt_all], 0
-    cmp byte [si], '-'
-    jne .ask
-    mov byte [fmt_all], 1
-.ask:
-    mov si, msg_fmt_ask
-    call Print
-    call ReadLine
-    jc .no
-    mov al, [inbuf]
-    or al, 0x20
-    cmp al, 'y'
-    jne .no
-    call LoadFAT
-    jc near disk_err
-    call LoadRoot
-    jc near disk_err
-    mov bx, dirbuf
-    mov cx, [rootent]
-.l:
-    mov al, [bx]
-    test al, al
-    jz .done
-    cmp al, 0xE5
-    je .next
-    test byte [bx+11], 0x08
-    jnz .next
-    cmp byte [fmt_all], 0
-    jne .del
-    mov si, sys_name
-    call Name11Eq
-    je .next
-.del:
-    mov ax, [bx+26]
-    call FreeChain
-    mov byte [bx], 0xE5
-.next:
-    add bx, 32
-    loop .l
-.done:
-    call FlushFAT
-    jc near disk_err
-    call SaveRoot
-    jc near disk_err
-    mov si, msg_fmt_done
-    call Print
-    ret
-.no:
-    mov si, msg_cancel
-    call Print
-    ret
-
-; Полное форматирование выбранного BIOS-привода в FAT12 (1.44 МБ)
-cmd_fmt_full:
-    cmp byte [si], 0
-    je .usage
-    mov al, [si]
-    cmp al, '0'
-    jb .usage
-    cmp al, '9'
-    ja .usage
-    call ParseNumber                ; "0x81" -> 0x81
-    mov [fmt_drv], al
-    mov si, msg_fmt_full_ask
-    call Print
-    call ReadLine
-    jc .no
-    mov al, [inbuf]
-    or al, 0x20
-    cmp al, 'y'
-    jne .no
-
-    mov al, [bdrive]
-    mov [fmt_old], al
-    mov al, [fmt_drv]
-    mov [bdrive], al
-    mov word [part_base], 0
-
-    ; --- загрузочный сектор и BPB ---
-    mov di, secbuf
-    mov cx, 512
-    xor al, al
-    rep stosb
-    mov byte [secbuf], 0xEB
-    mov byte [secbuf+1], 0x3C
-    mov byte [secbuf+2], 0x90
-    mov si, oemname
-    mov di, secbuf+3
-    mov cx, 8
-    rep movsb
-    mov word [secbuf+11], 512       ; байт/сектор
-    mov byte [secbuf+13], 1         ; секторов/кластер
-    mov word [secbuf+14], 1         ; зарезервировано
-    mov byte [secbuf+16], 2         ; число FAT
-    mov word [secbuf+17], 224       ; записей в root
-    mov word [secbuf+19], 2880      ; всего секторов
-    mov byte [secbuf+21], 0xF0      ; media descriptor
-    mov word [secbuf+22], 9         ; секторов на FAT
-    mov word [secbuf+24], 18        ; spt
-    mov word [secbuf+26], 2         ; heads
-    mov word [secbuf+28], 0         ; hidden sectors
-    mov word [secbuf+30], 0
-    mov word [secbuf+510], 0xAA55
-
-    mov ax, 0
-    mov bx, secbuf
-    call WrK
-    jc .err
-
-    ; --- две копии FAT (по 9 секторов нулей) ---
-    mov di, fatbuf
-    mov cx, 6144
-    xor al, al
-    rep stosb
-    mov ax, 1
-    mov cx, 9
-    mov bx, fatbuf
-.wfat1:
-    call WrK
-    jc .err
-    inc ax
-    loop .wfat1
-    mov ax, 10
-    mov cx, 9
-    mov bx, fatbuf
-.wfat2:
-    call WrK
-    jc .err
-    inc ax
-    loop .wfat2
-
-    ; --- корневой каталог: 14 секторов нулей ---
-    mov di, dirbuf
-    mov cx, 7168
-    xor al, al
-    rep stosb
-    mov ax, 19
-    mov cx, 14
-    mov bx, dirbuf
-.wroot:
-    call WrK
-    jc .err
-    inc ax
-    loop .wroot
-
-    mov si, msg_fmt_done
-    call Print
-    jmp .restore
-
-.err:
-    mov si, msg_diskerr
-    call Print
-.restore:
-    mov al, [fmt_old]
-    mov [bdrive], al
-    call MountDrive
-    call LoadRoot
-    ret
-.usage:
-    mov si, msg_use_fmt
-    call Print
-    ret
-.no:
-    mov si, msg_cancel
-    call Print
-    ret
-
-cmd_fsck:
-    mov byte [fsck_fix], 0
-    cmp byte [si], '-'
-    jne .go
-    mov byte [fsck_fix], 1
-.go:
-    call LoadFAT
-    jc near disk_err
-    call LoadRoot
-    jc near disk_err
-    mov di, fsck_map
-    mov cx, 512
-.z:
-    mov byte [di], 0
-    inc di
-    loop .z
-    xor ax, ax
-    mov [fk_files], ax
-    mov [fk_err], ax
-    mov [fk_lost], ax
-    mov bx, dirbuf
-    mov cx, [rootent]
-.ent:
-    mov al, [bx]
-    test al, al
-    jz .scan
-    cmp al, 0xE5
-    je .nx
-    test byte [bx+11], 0x08
-    jnz .nx
-    inc word [fk_files]
-    mov ax, [bx+26]
-.walk:
-    cmp ax, 2
-    jb .nx
-    cmp ax, 0x0FF8
-    jae .nx
-    cmp ax, [maxcl]
-    ja .bad
-    call BitTest
-    jnz .cross
-    call BitSet
-    call GetFAT
-    jmp .walk
-.cross:
-    mov si, msg_fk_cross
-    jmp .rep
-.bad:
-    mov si, msg_fk_bad
-.rep:
-    inc word [fk_err]
-    call Print
-    push si
-    mov si, bx
-    call PrintName83
-    pop si
-    call PrintNL
-.nx:
-    add bx, 32
-    loop .ent
-.scan:
-    mov cx, 2
-.sc:
-    cmp cx, [maxcl]
-    ja .rep2
-    mov ax, cx
-    call GetFAT
-    test ax, ax
-    jz .scn
-    mov ax, cx
-    call BitTest
-    jnz .scn
-    inc word [fk_lost]
-    cmp byte [fsck_fix], 0
-    je .scn
-    mov ax, cx
-    xor dx, dx
-    call SetFAT
-.scn:
-    inc cx
-    jmp .sc
-.rep2:
-    mov ax, [fk_files]
-    mov si, msg_fk_files
-    call PrintLn
-    mov ax, [fk_err]
-    mov si, msg_fk_err
-    call PrintLn
-    mov ax, [fk_lost]
-    mov si, msg_fk_lost
-    call PrintLn
-    cmp byte [fsck_fix], 0
-    je .nl
-    cmp word [fk_lost], 0
-    je .nl
-    call FlushFAT
-    mov si, msg_fk_fixed
-    call Print
-.nl:
     call PrintNL
     ret
 
@@ -2372,8 +1700,7 @@ cmd_echo:
     ret
 
 cmd_clear:
-    mov ax, 0x0003
-    int 0x10
+    call ClearScreen
     ret
 
 cmd_reboot:
@@ -2629,8 +1956,8 @@ WaitTask:                       ; AL = slot, wait until it finishes (Ctrl+C kill
 .nokey:
     cmp byte [wt_ran], 0
     jne .l
-    ; Раньше здесь было sti/hlt: на железе, где BIOS не размаскировал
-    ; IRQ0 таймера, WaitTask висел навсегда. Крутимся без hlt.
+    sti
+    hlt
     jmp .l
 .done:
     pop si
@@ -2736,13 +2063,21 @@ RunSession:                     ; SI = statement line (DS)
 
 cmd_plb:
     mov di, fn83
-    call To83
-    jc near need_arg
+    call GetPath
+    jc near path_fail
+    mov [dir_want], ax
     cmp byte [fn83+8], ' '
-    jne .ext
+    jne .hasx
     mov byte [fn83+8], 'P'
     mov byte [fn83+9], 'L'
     mov byte [fn83+10], 'B'
+    push si
+    mov si, k_dotplb
+    call AbsAppend
+    pop si
+.hasx:
+    call CheckRun
+    jc near nop_ret
 .ext:
     cmp byte [si], ' '
     jne .a
@@ -2795,6 +2130,9 @@ cmd_ps:
     je .st
     mov si, ps_sleep
     cmp al, ST_SLEEP
+    je .st
+    mov si, ps_gui
+    cmp al, ST_GUI
     je .st
     mov si, ps_dead
 .st:
@@ -4129,9 +3467,12 @@ f_exists:
     push si
     mov si, bx
     mov di, fn83
-    call To83
+    call GetPath
+    jc .gf
+    mov [dir_want], ax
     mov si, fn83
     call FindEntry
+.gf:
     pop si
     mov ax, 0
     jc .r
@@ -4613,8 +3954,7 @@ st_stop:
     jmp TaskExit
 
 st_cls:
-    mov ax, 0x0003
-    int 0x10
+    call ClearScreen
     ret
 
 st_sleep:
@@ -4663,8 +4003,9 @@ st_save:
     mov dx, ax
     mov si, strbuf
     mov di, fn83
-    call To83
+    call GetPath
     jc .syn
+    mov [dir_want], ax
     mov si, printbuf
     mov di, T_TMP
     mov cx, dx
@@ -4705,8 +4046,9 @@ st_load:
     call EvalStr
     mov si, strbuf
     mov di, fn83
-    call To83
+    call GetPath
     jc .empty
+    mov [dir_want], ax
     mov si, fn83
     call FindEntry
     jc .empty
@@ -4833,8 +4175,10 @@ EDMAX       equ 0x6F00
 
 cmd_edit:
     mov di, fn83
-    call To83
-    jc near need_arg
+    call GetPath
+    jc near path_fail
+    mov [dir_want], ax
+    mov [ed_dir], ax
     mov si, fn83
     mov di, ed_name
     mov cx, 11
@@ -4872,11 +4216,9 @@ cmd_edit:
     mov byte [ed_mod], 0
     mov ax, VIDEO
     mov fs, ax
-    mov ax, 0x0003
-    int 0x10
+    call ClearScreen
     call EdLoop
-    mov ax, 0x0003
-    int 0x10
+    call ClearScreen
     ret
 
 EdStripCR:
@@ -5222,6 +4564,8 @@ EdDown:
 
 EdSave:
     pusha
+    mov ax, [ed_dir]
+    mov [dir_want], ax
     mov ax, EDSEG
     mov [xfer_seg], ax
     mov word [xfer_off], 0
@@ -5397,7 +4741,6 @@ cmd_table:
     dw n_df, cmd_df
     dw n_disk, cmd_disk
     dw n_drive, cmd_drive
-    dw n_drives, cmd_drives
     dw n_format, cmd_format
     dw n_fsck, cmd_fsck
     dw n_sec, cmd_sec
@@ -5414,6 +4757,14 @@ cmd_table:
     dw n_reboot, cmd_reboot
     dw n_poweroff, cmd_poweroff
     dw n_shutdown, cmd_poweroff
+    dw n_dmesg, cmd_dmesg
+    dw n_mkdir, cmd_mkdir
+    dw n_rmdir, cmd_rmdir
+    dw n_cd, cmd_cd
+    dw n_pwd, cmd_pwd
+    dw n_whoami, cmd_whoami
+    dw n_su, cmd_su
+    dw n_logout, cmd_logout
     dw 0
 
 n_help      db "help", 0
@@ -5439,8 +4790,6 @@ n_fg        db "fg", 0
 n_df        db "df", 0
 n_disk      db "disk", 0
 n_drive     db "drive", 0
-n_drives    db "drives", 0
-n_fmt       db "fmt", 0
 n_format    db "format", 0
 n_fsck      db "fsck", 0
 n_sec       db "sec", 0
@@ -5461,56 +4810,17 @@ n_shutdown  db "shutdown", 0
 ; ------------------------------------------------------------
 ; Messages
 ; ------------------------------------------------------------
-bl_00 db "SpheraOS boot log:", 10, 0
-bl_01 db "[    0.000000] SpheraOS 3.0 - Plumbum kernel starting...", 10, 0
-bl_02 db "[    0.000014] BIOS: x86 16-bit real-mode machine", 10, 0
-bl_03 db "[    0.000037] CPU: 8086-compatible instruction set", 10, 0
-bl_04 db "[    0.000061] A20 address gate: enabled", 10, 0
-bl_05 db "[    0.000088] BIOS memory: 640K conventional RAM", 10, 0
-bl_06 db "[    0.000112] BIOS disk services: int 13h available", 10, 0
-bl_07 db "[    0.000139] Scanning BIOS drives 0x00-0xFF...", 10, 0
-bl_08 db "[    0.000163] Boot sector signature 0xAA55: OK", 10, 0
-bl_09 db "[    0.000190] FAT12 BPB: 512 B/sector, 1 sector/cluster", 10, 0
-bl_10 db "[    0.000214] FAT12: 2 FAT copies, 224 root entries", 10, 0
-bl_11 db "[    0.000238] FAT12: root directory -> DIRBUF 7 KB", 10, 0
-bl_12 db "[    0.000262] FAT12: FAT table -> FATBUF 6 KB", 10, 0
-bl_13 db "[    0.000285] Disk layer: LBA read/write, CHS fallback", 10, 0
-bl_14 db "[    0.000309] Plumbum shell: command table loaded", 10, 0
-bl_15 db "[    0.000333] Shell: 128-byte line, 128-byte history", 10, 0
-bl_16 db "[    0.000357] PLB interpreter: expressions, variables", 10, 0
-bl_17 db "[    0.000381] PLB builtins: len asc val rnd abs ticks", 10, 0
-bl_18 db "[    0.000405] PLB builtins: key exists chr str mid", 10, 0
-bl_19 db "[    0.000429] Scheduler: 6 task slots, 20-line slice", 10, 0
-bl_20 db "[    0.000453] Task segments: 0x2000-0x7FFF (4 KB each)", 10, 0
-bl_21 db "[    0.000477] Kernel segment 0x1000, stack 0xFFF0", 10, 0
-bl_22 db "[    0.000501] Buffers: DIRBUF 7K FATBUF 6K SEC 512B", 10, 0
-bl_23 db "[    0.000525] Keyboard: 128-entry scancode table", 10, 0
-bl_24 db "[    0.000549] Video: 80x25 text mode at 0xB8000", 10, 0
-bl_25 db "[    0.000573] GUI loader: .APP images enabled", 10, 0
-bl_26 db "[    0.000597] SDK.INC: system API exported", 10, 0
-bl_27 db "[    0.000621] Files: KERNEL.BIN, *.BIN, *.APP, *.PLB", 10, 0
-bl_28 db "[    0.000645] AUTOEXEC.PLB: startup script queued", 10, 0
-bl_29 db "[    0.000669] Mounting root filesystem...", 10, 0
-bl_30 db "[    0.000693] Starting Plumbum shell...", 10, 0
-
-boot_log_table:
-    dw bl_00, bl_01, bl_02, bl_03, bl_04, bl_05, bl_06, bl_07
-    dw bl_08, bl_09, bl_10, bl_11, bl_12, bl_13, bl_14, bl_15
-    dw bl_16, bl_17, bl_18, bl_19, bl_20, bl_21, bl_22, bl_23
-    dw bl_24, bl_25, bl_26, bl_27, bl_28, bl_29, bl_30
-    dw 0
-
 auto_name   db "AUTOEXECPLB"
 sys_name    db "KERNEL  BIN"
 auto_cmd    db "plb AUTOEXEC.PLB", 0
 
 msg_banner  db 10
-            db "  ___ ___ _                  ___  ___", 10
-            db " / __| _ \ |_  ___ _ _ __ _ / _ \/ __|", 10
+            db "  ___ ___ _               ___  ___", 10
+            db " / __| _ \ |_  ___ _ _ __ _/ _ \/ __|", 10
             db " \__ \  _/ ' \/ -_) '_/ _` | (_) \__ \", 10
-            db " |___/_| |_||_\___|_| \__,_|\___/|___/  v3.0", 10
+            db " |___/_| |_||_\___|_| \__,_|\___/|___/  v4.0", 10
             db 10
-            db " Plumbum shell. Type 'help'.", 10, 10, 0
+            db " Plumbum shell + PLB language. Type 'help'.", 10, 10, 0
 msg_nomount db "No FAT12 filesystem found on this drive.", 10, 0
 msg_prompt  db ":\> ", 0
 msg_ctrlc   db "^C", 10, 0
@@ -5533,13 +4843,6 @@ msg_fat12   db ": FAT12, total ", 0
 msg_used    db "  used: ", 0
 msg_free    db "  free: ", 0
 msg_biosdrv db ": (BIOS drive 0x", 0
-oemname     db "MSDOS5.0"
-msg_fmt_full_ask db "Format selected drive as FAT12? (y/n): ", 0
-msg_use_fmt  db "Usage: fmt 0x81", 0
-msg_drives  db "BIOS drives:", 13, 10, 0
-msg_drvnum  db "  drive 0x", 0
-msg_hdd     db " (HDD)", 0
-msg_floppy  db " (FDD)", 0
 msg_d_spt   db "  sectors/track : ", 0
 msg_d_heads db "  heads         : ", 0
 msg_d_total db "  total sectors : ", 0
@@ -5574,6 +4877,7 @@ msg_ps_hdr  db "PID  STATE  MODE NAME", 10, 0
 ps_run      db "run    ", 0
 ps_sleep    db "sleep  ", 0
 ps_dead     db "dying  ", 0
+ps_gui      db "gui    ", 0
 ps_fg       db "fg   ", 0
 ps_bg       db "bg   ", 0
 
@@ -5613,10 +4917,12 @@ msg_ed_fail db "SAVE FAILED!", 0
 msg_ed_ask  db "Unsaved changes. Save before exit? (y = save, n = discard, other = back)", 0
 
 msg_help    db "SpheraOS commands:", 10
-            db " files : ls cat cp mv rm touch edit hd run", 10
+            db " files : ls cat cp mv rm touch edit hd run   dirs: cd pwd mkdir rmdir", 10
             db " tasks : plb FILE [&]   ps   kill N   killall   fg N", 10
-            db " disk  : df drives drive 0x81 format [-all] format 0x81 fsck [-f] sec N", 10
-            db " system: mem uptime time date ver sysfetch clear echo", 10
+            db " disk  : df disk drive a|b|c format [-all] fsck [-f] sec N", 10
+            db " system: mem uptime time date ver sysfetch clear echo dmesg", 10
+            db " users : whoami su logout  (config: /SYS/USERS.CFG, root only)", 10
+            db " apps  : run /GUI.BIN (desktop)  run /GAMES/SNAKE.BIN  run /GAMES/DOOMISH.BIN", 10
             db "         reboot poweroff", 10
             db 10
             db "Plumbum is also a language: type statements right here:", 10
@@ -5639,119 +4945,2786 @@ msg_plbhelp db "Plumbum (PLB) language", 10
             db " comments: # ...      shell commands work in scripts too", 10
             db " run: plb file.plb      background: plb file.plb &", 10, 0
 
+
+; ============================================================
+; Console driver (direct VRAM), kernel log (dmesg), boot log
+; ============================================================
+PutC:                           ; AL = char
+    pusha
+    push es
+    mov bx, VIDEO
+    mov es, bx
+    cmp byte [log_on], 0
+    je .nolog
+    mov bx, [log_len]
+    cmp bx, 2040
+    jae .nolog
+    mov [klog+bx], al
+    inc word [log_len]
+.nolog:
+    cmp al, 0x0A
+    je .lf
+    cmp al, 0x0D
+    je .cr
+    cmp al, 0x08
+    je .bs
+    cmp al, 0x09
+    je .tab
+    call ConPut
+    jmp .fin
+.tab:
+    mov al, ' '
+    call ConPut
+    test byte [con_col], 7
+    jnz .tab
+    jmp .fin
+.lf:
+    mov byte [con_col], 0
+    inc byte [con_row]
+    jmp .fin
+.cr:
+    mov byte [con_col], 0
+    jmp .fin
+.bs:
+    cmp byte [con_col], 0
+    je .fin
+    dec byte [con_col]
+.fin:
+    cmp byte [con_row], 25
+    jb .cur
+    call ConScroll
+.cur:
+    call HwCursor
+    pop es
+    popa
+    ret
+
+ConPut:                         ; AL = printable char, ES = VIDEO
+    push ax
+    mov ah, [con_attr]
+    push ax
+    mov al, [con_row]
+    xor ah, ah
+    mov bx, 80
+    mul bx
+    movzx bx, byte [con_col]
+    add ax, bx
+    shl ax, 1
+    mov di, ax
+    pop ax
+    mov [es:di], ax
+    inc byte [con_col]
+    cmp byte [con_col], 80
+    jb .r
+    mov byte [con_col], 0
+    inc byte [con_row]
+.r:
+    pop ax
+    ret
+
+ConScroll:                      ; ES = VIDEO
+    push ds
+    mov ax, VIDEO
+    mov ds, ax
+    xor di, di
+    mov si, 160
+    mov cx, 80*24
+    rep movsw
+    pop ds
+    mov ah, [con_attr]
+    mov al, ' '
+    mov di, 24*160
+    mov cx, 80
+    rep stosw
+    mov byte [con_row], 24
+    ret
+
+HwCursor:
+    mov al, [con_row]
+    xor ah, ah
+    mov bx, 80
+    mul bx
+    movzx bx, byte [con_col]
+    add ax, bx
+    mov bx, ax
+    mov dx, 0x3D4
+    mov al, 0x0F
+    out dx, al
+    inc dx
+    mov al, bl
+    out dx, al
+    dec dx
+    mov al, 0x0E
+    out dx, al
+    inc dx
+    mov al, bh
+    out dx, al
+    ret
+
+ClearScreen:
+    pusha
+    push es
+    mov ax, VIDEO
+    mov es, ax
+    xor di, di
+    mov ah, [con_attr]
+    mov al, ' '
+    mov cx, 2000
+    rep stosw
+    mov byte [con_row], 0
+    mov byte [con_col], 0
+    call HwCursor
+    pop es
+    popa
+    ret
+
+Mul32by16:                      ; DX:AX * CX -> DX:AX (no overflow assumed)
+    push bx
+    mov bx, dx
+    mul cx
+    push ax
+    push dx
+    mov ax, bx
+    mul cx
+    pop dx
+    add dx, ax
+    pop ax
+    pop bx
+    ret
+
+CentiSecs:                      ; -> DX:AX hundredths of a second since boot
+    xor ax, ax
+    int 0x1A
+    sub dx, [boot_t]
+    sbb cx, [boot_t+2]
+    jnc .ok
+    add dx, 0x00B0
+    adc cx, 0x0018
+.ok:
+    mov ax, dx
+    mov dx, cx
+    mov cx, 500
+    call Mul32by16
+    mov cx, 91
+    call Div32by16
+    ret
+
+KlogBegin:                      ; prints "[ sss.cc] " and starts capturing into the log
+    pusha
+    mov byte [log_on], 1
+    mov al, '['
+    call PutC
+    call CentiSecs
+    mov cx, 100
+    call Div32by16
+    push bx
+    call NumToStr
+    mov si, numbuf
+    xor cx, cx
+.l1:
+    cmp byte [si], 0
+    je .l2
+    inc si
+    inc cx
+    jmp .l1
+.l2:
+    mov ax, 4
+    sub ax, cx
+    jbe .np
+    mov cx, ax
+.pad:
+    mov al, ' '
+    call PutC
+    loop .pad
+.np:
+    mov si, numbuf
+    call Print
+    mov al, '.'
+    call PutC
+    pop ax
+    xor dx, dx
+    mov cx, 10
+    div cx
+    add al, '0'
+    call PutC
+    mov al, dl
+    add al, '0'
+    call PutC
+    mov al, ']'
+    call PutC
+    mov al, ' '
+    call PutC
+    popa
+    ret
+
+KlogEnd:
+    call PrintNL
+    mov byte [log_on], 0
+    ret
+
+cmd_dmesg:
+    mov cx, [log_len]
+    xor bx, bx
+.l:
+    test cx, cx
+    jz .d
+    mov al, [klog+bx]
+    call PutC
+    inc bx
+    dec cx
+    jmp .l
+.d:
+    ret
+
+n_dmesg     db "dmesg", 0
+
+
+; ============================================================
+; Directories, path resolution, access checks, glob matching
+; ============================================================
+DIR_SECS    equ 8
+
+LoadRoot:                       ; makes dirbuf hold the directory [dir_want]
+    cmp byte [dir_ok], 0
+    je .go
+    mov ax, [dir_want]
+    cmp ax, [dir_cur]
+    jne .go
+    clc
+    ret
+.go:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    call LoadFAT
+    jc near .err
+    mov byte [dir_ok], 0
+    mov ax, [dir_want]
+    test ax, ax
+    jnz .sub
+    mov ax, [root_start]
+    mov bx, dirbuf
+    mov cx, [root_secs]
+.rl:
+    call RdK
+    jc .err
+    inc ax
+    add bx, 512
+    loop .rl
+    mov ax, [root_secs]
+    mov [dir_secs], ax
+    jmp .fin
+.sub:
+    mov bx, dirbuf
+    xor si, si
+.cl:
+    cmp ax, 2
+    jb .fin0
+    cmp ax, 0x0FF8
+    jae .fin0
+    mov [ld_clu], ax
+    sub ax, 2
+    mul word [spc]
+    add ax, [data_start]
+    mov cx, [spc]
+.sl:
+    cmp si, 14
+    jae .fin0
+    call RdK
+    jc .err
+    inc ax
+    add bx, 512
+    inc si
+    loop .sl
+    mov ax, [ld_clu]
+    call GetFAT
+    jmp .cl
+.fin0:
+    mov [dir_secs], si
+.fin:
+    mov ax, [dir_secs]
+    shl ax, 4
+    mov [dir_ents], ax
+    mov ax, [dir_want]
+    mov [dir_cur], ax
+    mov byte [dir_ok], 1
+    clc
+    jmp .out
+.err:
+    stc
+.out:
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+SaveRoot:                       ; writes the directory in dirbuf back to disk
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    mov ax, [dir_cur]
+    test ax, ax
+    jnz .sub
+    mov ax, [root_start]
+    mov bx, dirbuf
+    mov cx, [root_secs]
+.rl:
+    call WrK
+    jc .err
+    inc ax
+    add bx, 512
+    loop .rl
+    jmp .ok
+.sub:
+    mov bx, dirbuf
+    xor si, si
+.cl:
+    cmp ax, 2
+    jb .ok
+    cmp ax, 0x0FF8
+    jae .ok
+    mov [ld_clu], ax
+    sub ax, 2
+    mul word [spc]
+    add ax, [data_start]
+    mov cx, [spc]
+.sl:
+    cmp si, [dir_secs]
+    jae .ok
+    call WrK
+    jc .err
+    inc ax
+    add bx, 512
+    inc si
+    loop .sl
+    mov ax, [ld_clu]
+    call GetFAT
+    jmp .cl
+.ok:
+    clc
+    jmp .out
+.err:
+    stc
+.out:
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+Copy11:                         ; DS:SI -> DS:DI, 11 bytes
+    push ax
+    push cx
+    push si
+    push di
+    mov cx, 11
+.l:
+    mov al, [si]
+    mov [di], al
+    inc si
+    inc di
+    loop .l
+    pop di
+    pop si
+    pop cx
+    pop ax
+    ret
+
+PathPush:                       ; append "/" + comptmp to abspath
+    push ax
+    push si
+    push di
+    mov di, abspath
+.e:
+    cmp byte [di], 0
+    je .f
+    inc di
+    jmp .e
+.f:
+    cmp di, abspath+60
+    jae .r
+    cmp di, abspath+1
+    je .nos
+    mov byte [di], '/'
+    inc di
+.nos:
+    mov si, comptmp
+.c:
+    mov al, [si]
+    mov [di], al
+    inc si
+    inc di
+    test al, al
+    jnz .c
+.r:
+    pop di
+    pop si
+    pop ax
+    ret
+
+PathPop:
+    push si
+    push di
+    mov di, abspath
+.e:
+    cmp byte [di], 0
+    je .b
+    inc di
+    jmp .e
+.b:
+    cmp di, abspath+1
+    jbe .r
+.s:
+    dec di
+    cmp byte [di], '/'
+    jne .s
+    cmp di, abspath
+    jne .t
+    inc di
+.t:
+    mov byte [di], 0
+.r:
+    pop di
+    pop si
+    ret
+
+Glob:                           ; SI = pattern, DI = text -> CF=1 if it matches
+    push ax
+    push bx
+    push dx
+    push si
+    push di
+    xor bx, bx
+    xor dx, dx
+.l:
+    mov al, [si]
+    cmp al, '*'
+    je .star
+    mov ah, [di]
+    test al, al
+    jz .pend
+    cmp al, '?'
+    je .q
+    cmp al, ah
+    je .eq
+    jmp .mis
+.q:
+    test ah, ah
+    jz .mis
+.eq:
+    inc si
+    inc di
+    jmp .l
+.star:
+    inc si
+    mov bx, si
+    mov dx, di
+    jmp .l
+.pend:
+    test ah, ah
+    jz .yes
+.mis:
+    test bx, bx
+    jz .no
+    mov di, dx
+    cmp byte [di], 0
+    je .no
+    inc dx
+    mov di, dx
+    mov si, bx
+    jmp .l
+.yes:
+    stc
+    jmp .out
+.no:
+    clc
+.out:
+    pop di
+    pop si
+    pop dx
+    pop bx
+    pop ax
+    ret
+
+GlobList:                       ; SI = comma separated patterns, DI = text -> CF=1 if any matches
+    push ax
+    push cx
+    push si
+    push di
+.next:
+    cmp byte [si], 0
+    je .no
+    push di
+    mov di, globtmp
+    xor cx, cx
+.c:
+    mov al, [si]
+    test al, al
+    jz .ce
+    inc si
+    cmp al, ','
+    je .ce
+    cmp al, ' '
+    je .c
+    cmp cx, 60
+    jae .c
+    call UpCase
+    mov [di], al
+    inc di
+    inc cx
+    jmp .c
+.ce:
+    mov byte [di], 0
+    pop di
+    test cx, cx
+    jz .next
+    push si
+    mov si, globtmp
+    call Glob
+    pop si
+    jc .yes
+    jmp .next
+.no:
+    clc
+    jmp .out
+.yes:
+    stc
+.out:
+    pop di
+    pop si
+    pop cx
+    pop ax
+    ret
+
+CheckAccess:                    ; abspath -> CF=1 if denied
+    push si
+    mov si, abspath
+    call CheckPath
+    pop si
+    ret
+
+CheckPath:                      ; SI = absolute upper-case path -> CF=1 if denied for the current user
+    push ax
+    push si
+    push di
+    cmp byte [u_root], 0
+    jne .ok
+    mov di, k_sysdir
+    push si
+.c:
+    mov al, [di]
+    test al, al
+    jz .chk
+    cmp al, [si]
+    jne .nosys
+    inc si
+    inc di
+    jmp .c
+.chk:
+    mov al, [si]
+    test al, al
+    jz .deny2
+    cmp al, '/'
+    je .deny2
+.nosys:
+    pop si
+    mov di, si
+    mov si, u_hide
+    call GlobList
+    jc .deny
+.ok:
+    clc
+    jmp .out
+.deny2:
+    pop si
+.deny:
+    stc
+.out:
+    pop di
+    pop si
+    pop ax
+    ret
+
+GetPath:                        ; SI = path, DI = name83 buffer -> AX = parent dir cluster, CF on error
+    push bx
+    push cx
+    push dx
+    push di
+    mov [gp_dest], di
+    mov byte [gp_err], 0
+.sk0:
+    cmp byte [si], ' '
+    jne .t0
+    inc si
+    jmp .sk0
+.t0:
+    mov di, pathtmp
+    xor cx, cx
+.t:
+    mov al, [si]
+    test al, al
+    jz .te
+    cmp al, ' '
+    je .te
+    cmp cx, 70
+    jae .te
+    mov [di], al
+    inc si
+    inc di
+    inc cx
+    jmp .t
+.te:
+    mov byte [di], 0
+    test cx, cx
+    jnz .have
+    stc
+    jmp .out
+.have:
+    mov [gp_si], si
+    mov byte [gp_err], 1
+    cmp byte [pathtmp], '/'
+    je .abs
+    cmp byte [pathtmp], 0x5C
+    je .abs
+    mov si, cwd_path
+    mov di, abspath
+    call CopyStr
+    jmp .norm
+.abs:
+    mov byte [abspath], '/'
+    mov byte [abspath+1], 0
+.norm:
+    mov si, pathtmp
+.comp:
+    mov al, [si]
+    test al, al
+    jz .walk
+    cmp al, '/'
+    je .sk
+    cmp al, 0x5C
+    je .sk
+    mov di, comptmp
+    xor cx, cx
+.rc:
+    mov al, [si]
+    test al, al
+    jz .rce
+    cmp al, '/'
+    je .rce
+    cmp al, 0x5C
+    je .rce
+    inc si
+    cmp cx, 12
+    jae .rc
+    call UpCase
+    mov [di], al
+    inc di
+    inc cx
+    jmp .rc
+.rce:
+    mov byte [di], 0
+    cmp byte [comptmp], '.'
+    jne .app
+    cmp byte [comptmp+1], 0
+    je .comp
+    cmp byte [comptmp+1], '.'
+    jne .app
+    cmp byte [comptmp+2], 0
+    jne .app
+    call PathPop
+    jmp .comp
+.app:
+    call PathPush
+    jmp .comp
+.sk:
+    inc si
+    jmp .comp
+.walk:
+    call CheckAccess
+    jc .fail
+    xor ax, ax
+    mov [gp_dir], ax
+    cmp byte [abspath+1], 0
+    jne .wl
+    mov di, [gp_dest]
+    mov cx, 11
+.sp:
+    mov byte [di], ' '
+    inc di
+    loop .sp
+    jmp .ok
+.wl:
+    mov si, abspath+1
+.w1:
+    mov bx, si
+.f:
+    mov al, [bx]
+    test al, al
+    jz .last
+    cmp al, '/'
+    je .mid
+    inc bx
+    jmp .f
+.last:
+    mov di, [gp_dest]
+    call To83
+    jmp .ok
+.mid:
+    mov di, gp_name
+    call To83
+    inc si
+    mov ax, [gp_dir]
+    mov [dir_want], ax
+    push si
+    call LoadRoot
+    jc .failp
+    mov si, gp_name
+    call FindEntry
+    jc .failp
+    pop si
+    test byte [di+11], 0x10
+    jz .fail
+    mov ax, [di+26]
+    mov [gp_dir], ax
+    jmp .w1
+.failp:
+    pop si
+.fail:
+    stc
+    jmp .out
+.ok:
+    mov ax, [gp_dir]
+    mov si, [gp_si]
+    clc
+.out:
+    pop di
+    pop dx
+    pop cx
+    pop bx
+    ret
+
+path_fail:
+    cmp byte [gp_err], 0
+    je near need_arg
+    jmp not_found
+
+ResolveDirArg:                  ; SI = args -> AX = directory cluster (default: cwd), ls_path = its path
+    cmp byte [si], 0
+    jne .arg
+    mov ax, [cwd_clu]
+    mov si, cwd_path
+    mov di, ls_path
+    call CopyStr
+    clc
+    ret
+.arg:
+    mov di, fn83
+    call GetPath
+    jc .r
+    cmp byte [abspath+1], 0
+    jne .sub
+    xor ax, ax
+    jmp .setp
+.sub:
+    mov [dir_want], ax
+    call LoadRoot
+    jc .bad
+    mov si, fn83
+    call FindEntry
+    jc .bad
+    test byte [di+11], 0x10
+    jz .bad
+    mov ax, [di+26]
+.setp:
+    mov si, abspath
+    mov di, ls_path
+    call CopyStr
+    clc
+.r:
+    ret
+.bad:
+    mov byte [gp_err], 1
+    stc
+    ret
+
+IsHidden:                       ; SI = dir entry, ls_path = its directory -> CF=1 if hidden for this user
+    push ax
+    push si
+    push di
+    cmp byte [u_root], 0
+    jne .no
+    mov di, hidtmp
+    push si
+    mov si, ls_path
+    call CopyStr
+    pop si
+.e:
+    cmp byte [di], 0
+    je .f
+    inc di
+    jmp .e
+.f:
+    cmp di, hidtmp+1
+    je .nos
+    mov byte [di], '/'
+    inc di
+.nos:
+    call Name83Text
+    mov si, hidtmp
+    call CheckPath
+    jmp .out
+.no:
+    clc
+.out:
+    pop di
+    pop si
+    pop ax
+    ret
+
+; ---- commands ------------------------------------------------
+cmd_ls:
+    call ResolveDirArg
+    jc near path_fail
+    mov [dir_want], ax
+    call LoadRoot
+    jc near disk_err
+    call LoadFAT
+    jc near disk_err
+    xor ax, ax
+    mov [ls_files], ax
+    mov [ls_bytes], ax
+    mov [ls_bytes+2], ax
+    mov bx, dirbuf
+    mov cx, [dir_ents]
+.l:
+    mov al, [bx]
+    test al, al
+    jz .done
+    cmp al, 0xE5
+    je .next
+    cmp al, '.'
+    je .next
+    test byte [bx+11], 0x08
+    jnz .next
+    mov si, bx
+    call IsHidden
+    jc .next
+    call PrintName83
+    test byte [bx+11], 0x10
+    jz .file
+    mov si, msg_dirtag
+    call Print
+    call PrintNL
+    jmp .next
+.file:
+    mov ax, [bx+28]
+    mov dx, [bx+30]
+    call PrintDec32
+    call PrintNL
+    inc word [ls_files]
+    add [ls_bytes], ax
+    adc [ls_bytes+2], dx
+.next:
+    add bx, 32
+    loop .l
+.done:
+    mov ax, [ls_files]
+    call PrintDec
+    mov si, msg_files
+    call Print
+    mov ax, [ls_bytes]
+    mov dx, [ls_bytes+2]
+    call PrintDec32
+    mov si, msg_bytes
+    call Print
+    call CountFree
+    mul word [cluster_bytes]
+    mov cx, 1024
+    call Div32by16
+    call PrintDec32
+    mov si, msg_kbfree
+    call Print
+    ret
+
+cmd_cd:
+    cmp byte [si], 0
+    jne .arg
+    mov si, k_slash
+.arg:
+    call ResolveDirArg
+    jc near path_fail
+    mov [cwd_clu], ax
+    mov si, ls_path
+    mov di, cwd_path
+    call CopyStr
+    ret
+
+cmd_pwd:
+    mov si, cwd_path
+    call Print
+    call PrintNL
+    ret
+
+cmd_mkdir:
+    mov di, fn83
+    call GetPath
+    jc near path_fail
+    cmp byte [fn83], ' '
+    je near .exists
+    mov [dir_want], ax
+    mov [mk_par], ax
+    call LoadRoot
+    jc near disk_err
+    mov si, fn83
+    call FindEntry
+    jnc near .exists
+    call LoadFAT
+    jc near disk_err
+    mov ax, DIR_SECS
+    xor dx, dx
+    div word [spc]
+    test ax, ax
+    jnz .n1
+    mov ax, 1
+.n1:
+    mov [mk_n], ax
+    mov cx, ax
+    xor bx, bx
+    xor si, si
+.al:
+    call AllocCluster
+    jc near .full
+    test bx, bx
+    jnz .lk
+    mov bx, ax
+    jmp .nx
+.lk:
+    push ax
+    mov dx, ax
+    mov ax, si
+    call SetFAT
+    pop ax
+.nx:
+    mov si, ax
+    loop .al
+    mov [mk_clu], bx
+    mov ax, [mk_n]
+    mul word [spc]
+    mov [dir_secs], ax
+    shl ax, 4
+    mov [dir_ents], ax
+    mov cx, [dir_secs]
+    shl cx, 8
+    mov di, dirbuf
+.z:
+    mov word [di], 0
+    add di, 2
+    loop .z
+    mov si, k_dot
+    mov di, dirbuf
+    call Copy11
+    mov byte [dirbuf+11], 0x10
+    mov ax, [mk_clu]
+    mov [dirbuf+26], ax
+    mov si, k_dotdot
+    mov di, dirbuf+32
+    call Copy11
+    mov byte [dirbuf+32+11], 0x10
+    mov ax, [mk_par]
+    mov [dirbuf+32+26], ax
+    mov ax, [mk_clu]
+    mov [dir_cur], ax
+    mov byte [dir_ok], 1
+    call SaveRoot
+    jc near disk_err
+    mov ax, [mk_par]
+    mov [dir_want], ax
+    call LoadRoot
+    jc near disk_err
+    call FindFree
+    jc .dfull
+    mov si, fn83
+    call Copy11
+    mov bx, di
+    mov byte [bx+11], 0x10
+    lea di, [bx+12]
+    mov cx, 14
+.zz:
+    mov byte [di], 0
+    inc di
+    loop .zz
+    mov ax, [mk_clu]
+    mov [bx+26], ax
+    mov word [bx+28], 0
+    mov word [bx+30], 0
+    call SaveRoot
+    jc near disk_err
+    call FlushFAT
+    jc near disk_err
+    ret
+.exists:
+    mov si, msg_exists
+    call Print
+    ret
+.full:
+    mov ax, bx
+    call FreeChain
+    mov si, msg_diskfull
+    call Print
+    ret
+.dfull:
+    mov si, msg_dirfull
+    call Print
+    ret
+
+cmd_rmdir:
+    mov di, fn83
+    call GetPath
+    jc near path_fail
+    cmp byte [fn83], ' '
+    je near .bad
+    mov [dir_want], ax
+    mov [mk_par], ax
+    call LoadRoot
+    jc near disk_err
+    mov si, fn83
+    call FindEntry
+    jc near not_found
+    test byte [di+11], 0x10
+    jz .notdir
+    mov ax, [di+26]
+    mov [mk_clu], ax
+    cmp ax, [cwd_clu]
+    je .busy
+    mov [dir_want], ax
+    call LoadRoot
+    jc near disk_err
+    mov bx, dirbuf
+    mov cx, [dir_ents]
+.e:
+    mov al, [bx]
+    test al, al
+    jz .empty
+    cmp al, 0xE5
+    je .nx
+    cmp al, '.'
+    jne .full
+.nx:
+    add bx, 32
+    loop .e
+.empty:
+    call LoadFAT
+    jc near disk_err
+    mov ax, [mk_clu]
+    call FreeChain
+    mov ax, [mk_par]
+    mov [dir_want], ax
+    call LoadRoot
+    jc near disk_err
+    mov si, fn83
+    call FindEntry
+    jc near disk_err
+    mov byte [di], 0xE5
+    call SaveRoot
+    jc near disk_err
+    call FlushFAT
+    jc near disk_err
+    ret
+.full:
+    mov si, msg_notempty
+    call Print
+    ret
+.notdir:
+    mov si, msg_notdir
+    call Print
+    ret
+.busy:
+    mov si, msg_busy
+    call Print
+    ret
+.bad:
+    jmp not_found
+
+cmd_rm:
+    mov di, fn83
+    call GetPath
+    jc near path_fail
+    mov [dir_want], ax
+    mov si, fn83
+    call FindEntry
+    jc near not_found
+    test byte [di+11], 0x10
+    jnz .isdir
+    mov si, fn83
+    call DeleteFile
+    jc near not_found
+    ret
+.isdir:
+    mov si, msg_isdir
+    call Print
+    ret
+
+cmd_touch:
+    mov di, fn83
+    call GetPath
+    jc near path_fail
+    mov [dir_want], ax
+    mov si, fn83
+    call FindEntry
+    jnc .r
+    xor dx, dx
+    mov si, fn83
+    call SaveFile
+.r:
+    ret
+
+cmd_cp:
+    call CpParse
+    jc .pf
+    mov ax, [cp_dsrc]
+    mov [dir_want], ax
+    mov si, fn83
+    call FindEntry
+    jc near not_found
+    test byte [di+11], 0x10
+    jnz .isdir
+    mov ax, SCRATCH
+    mov [xfer_seg], ax
+    mov word [xfer_off], 0
+    mov word [xfer_max], 0xF000
+    call LoadFile
+    jc near disk_err
+    mov dx, ax
+    mov ax, [cp_ddst]
+    mov [dir_want], ax
+    mov si, fn83b
+    call SaveFile
+    ret
+.isdir:
+    mov si, msg_isdir
+    call Print
+    ret
+.pf:
+    cmp byte [gp_err], 0
+    je .usage
+    jmp not_found
+.usage:
+    mov si, msg_use_cp
+    call Print
+    ret
+
+CpParse:                        ; parses two paths: fn83/cp_dsrc and fn83b/cp_ddst
+    mov di, fn83
+    call GetPath
+    jc .r
+    mov [cp_dsrc], ax
+    mov di, fn83b
+    call GetPath
+    jc .r
+    mov [cp_ddst], ax
+    clc
+.r:
+    ret
+
+cmd_mv:
+    call CpParse
+    jc near .pf
+    mov ax, [cp_ddst]
+    mov [dir_want], ax
+    mov si, fn83b
+    call FindEntry
+    jnc .exists
+    mov ax, [cp_dsrc]
+    cmp ax, [cp_ddst]
+    jne .move
+    mov [dir_want], ax
+    mov si, fn83
+    call FindEntry
+    jc near not_found
+    mov si, fn83b
+    call Copy11x
+    call SaveRoot
+    jc near disk_err
+    ret
+.move:
+    mov ax, [cp_dsrc]
+    mov [dir_want], ax
+    mov si, fn83
+    call FindEntry
+    jc near not_found
+    test byte [di+11], 0x10
+    jnz .isdir
+    mov ax, SCRATCH
+    mov [xfer_seg], ax
+    mov word [xfer_off], 0
+    mov word [xfer_max], 0xF000
+    call LoadFile
+    jc near disk_err
+    mov dx, ax
+    mov ax, [cp_ddst]
+    mov [dir_want], ax
+    mov si, fn83b
+    call SaveFile
+    jc .r
+    mov ax, [cp_dsrc]
+    mov [dir_want], ax
+    mov si, fn83
+    call DeleteFile
+.r:
+    ret
+.isdir:
+    mov si, msg_isdir
+    call Print
+    ret
+.exists:
+    mov si, msg_exists
+    call Print
+    ret
+.pf:
+    cmp byte [gp_err], 0
+    je .usage
+    jmp not_found
+.usage:
+    mov si, msg_use_mv
+    call Print
+    ret
+
+Copy11x:                        ; SI -> [DI] (entry name), keeps DI
+    push di
+    call Copy11
+    pop di
+    ret
+
+; ---- fsck (walks the whole directory tree) and format --------
+FsckCore:                       ; uses [fsck_fix]; fills fk_files / fk_err / fk_lost
+    call LoadFAT
+    jc near .r
+    mov di, fsck_map
+    mov cx, 512
+.z:
+    mov byte [di], 0
+    inc di
+    loop .z
+    xor ax, ax
+    mov [fk_files], ax
+    mov [fk_err], ax
+    mov [fk_lost], ax
+    mov [fk_i], ax
+    mov word [fk_n], 1
+    mov word [fk_list], 0
+.nextdir:
+    mov bx, [fk_i]
+    cmp bx, [fk_n]
+    jae near .scan
+    shl bx, 1
+    mov ax, [fk_list+bx]
+    inc word [fk_i]
+    mov [dir_want], ax
+    call LoadRoot
+    jc .nextdir
+    mov bx, dirbuf
+    mov cx, [dir_ents]
+.ent:
+    mov al, [bx]
+    test al, al
+    jz .nextdir
+    cmp al, 0xE5
+    je .nx
+    cmp al, '.'
+    je .nx
+    test byte [bx+11], 0x08
+    jnz .nx
+    inc word [fk_files]
+    mov ax, [bx+26]
+    test byte [bx+11], 0x10
+    jz .walk
+    mov si, [fk_n]
+    cmp si, 60
+    jae .walk
+    shl si, 1
+    mov [fk_list+si], ax
+    inc word [fk_n]
+.walk:
+    cmp ax, 2
+    jb .nx
+    cmp ax, 0x0FF8
+    jae .nx
+    cmp ax, [maxcl]
+    ja .bad
+    call BitTest
+    jnz .cross
+    call BitSet
+    call GetFAT
+    jmp .walk
+.cross:
+    mov si, msg_fk_cross
+    jmp .rep
+.bad:
+    mov si, msg_fk_bad
+.rep:
+    inc word [fk_err]
+    call Print
+    push si
+    mov si, bx
+    call PrintName83
+    pop si
+    call PrintNL
+.nx:
+    add bx, 32
+    loop .ent
+    jmp .nextdir
+.scan:
+    mov cx, 2
+.sc:
+    cmp cx, [maxcl]
+    ja .fin
+    mov ax, cx
+    call GetFAT
+    test ax, ax
+    jz .scn
+    mov ax, cx
+    call BitTest
+    jnz .scn
+    inc word [fk_lost]
+    cmp byte [fsck_fix], 0
+    je .scn
+    mov ax, cx
+    xor dx, dx
+    call SetFAT
+.scn:
+    inc cx
+    jmp .sc
+.fin:
+    cmp byte [fsck_fix], 0
+    je .r
+    cmp word [fk_lost], 0
+    je .r
+    call FlushFAT
+.r:
+    ret
+
+cmd_fsck:
+    mov byte [fsck_fix], 0
+    cmp byte [si], '-'
+    jne .go
+    mov byte [fsck_fix], 1
+.go:
+    call FsckCore
+    mov ax, [fk_files]
+    mov si, msg_fk_files
+    call PrintLn
+    mov ax, [fk_err]
+    mov si, msg_fk_err
+    call PrintLn
+    mov ax, [fk_lost]
+    mov si, msg_fk_lost
+    call PrintLn
+    cmp byte [fsck_fix], 0
+    je .nl
+    cmp word [fk_lost], 0
+    je .nl
+    mov si, msg_fk_fixed
+    call Print
+.nl:
+    call PrintNL
+    ret
+
+cmd_format:
+    mov byte [fmt_all], 0
+    cmp byte [si], '-'
+    jne .ask
+    mov byte [fmt_all], 1
+.ask:
+    mov si, msg_fmt_ask
+    call Print
+    call ReadLine
+    jc .no
+    mov al, [inbuf]
+    or al, 0x20
+    cmp al, 'y'
+    jne .no
+    mov word [dir_want], 0
+    call LoadRoot
+    jc near disk_err
+    mov bx, dirbuf
+    mov cx, [dir_ents]
+.l:
+    mov al, [bx]
+    test al, al
+    jz .done
+    cmp al, 0xE5
+    je .next
+    test byte [bx+11], 0x08
+    jnz .next
+    cmp byte [fmt_all], 0
+    jne .del
+    mov si, sys_name
+    call Name11Eq
+    je .next
+.del:
+    mov byte [bx], 0xE5
+.next:
+    add bx, 32
+    loop .l
+.done:
+    call SaveRoot
+    jc near disk_err
+    mov byte [fsck_fix], 1
+    call FsckCore
+    mov si, msg_fmt_done
+    call Print
+    ret
+.no:
+    mov si, msg_cancel
+    call Print
+    ret
+
+k_slash     db "/", 0
+k_sysdir    db "/SYS", 0
+k_dot       db ".          "
+k_dotdot    db "..         "
+msg_notempty db "Directory is not empty.", 10, 0
+msg_notdir  db "Not a directory.", 10, 0
+msg_busy    db "Directory is in use (cd elsewhere first).", 10, 0
+msg_isdir   db "That is a directory (use mkdir/rmdir/cd).", 10, 0
+n_mkdir     db "mkdir", 0
+n_rmdir     db "rmdir", 0
+n_cd        db "cd", 0
+n_pwd       db "pwd", 0
+
+
+; ============================================================
+; Users, login, system configuration, prompt, kernel API (int 0x80)
+;
+;  /SYS/SYSTEM.CFG   host=, color=, prompt=
+;  /SYS/USERS.CFG    user:password:role:run-globs:hidden-globs
+; ============================================================
+CFGMAX      equ 0x3000
+API_MAX     equ 16
+ST_GUI      equ 4
+
+CopyN:                          ; DS:SI -> DS:DI, at most CX chars, NUL-terminated
+    push ax
+    push cx
+    push si
+    push di
+.l:
+    test cx, cx
+    jz .e
+    mov al, [si]
+    test al, al
+    jz .e
+    mov [di], al
+    inc si
+    inc di
+    dec cx
+    jmp .l
+.e:
+    mov byte [di], 0
+    pop di
+    pop si
+    pop cx
+    pop ax
+    ret
+
+Klog:                           ; SI = message
+    call KlogBegin
+    call Print
+    call KlogEnd
+    ret
+
+KlogNum:                        ; SI = label, AX = number
+    call KlogBegin
+    call Print
+    call PrintDec
+    call KlogEnd
+    ret
+
+Elevate:                        ; become root for kernel-internal file access
+    mov al, [u_root]
+    mov [u_save], al
+    mov byte [u_root], 1
+    ret
+
+Demote:
+    mov al, [u_save]
+    mov [u_root], al
+    ret
+
+LoadCfg:                        ; SI = absolute path -> AX = length, text at [xfer_seg]:0 ; CF if missing
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    call Elevate
+    mov di, fn83
+    call GetPath
+    jc .fail
+    mov [dir_want], ax
+    call LoadRoot
+    jc .fail
+    mov si, fn83
+    call FindEntry
+    jc .fail
+    mov ax, SCRATCH
+    mov [xfer_seg], ax
+    mov word [xfer_off], 0
+    mov word [xfer_max], CFGMAX
+    call LoadFile
+    jc .fail
+    push es
+    mov es, [xfer_seg]
+    mov bx, ax
+    mov byte [es:bx], 0
+    pop es
+    clc
+    jmp .out
+.fail:
+    stc
+.out:
+    pushf
+    call Demote
+    popf
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    ret
+
+WriteStr:                       ; SI = absolute path, BX = asciiz data (kernel) -> CF on error
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    mov [ws_data], bx
+    mov di, bx
+    xor dx, dx
+.l:
+    cmp byte [di], 0
+    je .e
+    inc di
+    inc dx
+    jmp .l
+.e:
+    call Elevate
+    mov di, fn83
+    call GetPath
+    jc .fail
+    mov [dir_want], ax
+    mov ax, cs
+    mov [xfer_seg], ax
+    mov ax, [ws_data]
+    mov [xfer_off], ax
+    mov si, fn83
+    call SaveFile
+    jmp .done
+.fail:
+    stc
+.done:
+    pushf
+    call Demote
+    popf
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+CfgNextLine:                    ; ES:SI text -> cfgline ; CF=1 at end of text
+    push ax
+    push cx
+    push di
+    cmp byte [es:si], 0
+    je .end
+    mov di, cfgline
+    xor cx, cx
+.c:
+    mov al, [es:si]
+    test al, al
+    jz .e
+    inc si
+    cmp al, 0x0A
+    je .e
+    cmp al, 13
+    je .c
+    cmp cx, 126
+    jae .c
+    mov [di], al
+    inc di
+    inc cx
+    jmp .c
+.e:
+    mov byte [di], 0
+    clc
+    jmp .r
+.end:
+    stc
+.r:
+    pop di
+    pop cx
+    pop ax
+    ret
+
+HexByte:                        ; DS:SI -> AL
+    push bx
+    xor bx, bx
+    cmp byte [si], '0'
+    jne .l
+    mov al, [si+1]
+    or al, 0x20
+    cmp al, 'x'
+    jne .l
+    add si, 2
+.l:
+    mov al, [si]
+    cmp al, '0'
+    jb .d
+    cmp al, '9'
+    jbe .dg
+    or al, 0x20
+    cmp al, 'a'
+    jb .d
+    cmp al, 'f'
+    ja .d
+    sub al, 'a'-10
+    jmp .a
+.dg:
+    sub al, '0'
+.a:
+    shl bl, 4
+    or bl, al
+    inc si
+    jmp .l
+.d:
+    mov al, bl
+    pop bx
+    ret
+
+InitDefaults:
+    mov si, def_host
+    mov di, host_name
+    call CopyStr
+    mov si, def_prompt
+    mov di, prompt_fmt
+    call CopyStr
+    mov byte [term_color], 0x07
+    ret
+
+ParseSys:                       ; applies the text of SYSTEM.CFG found at [xfer_seg]:0
+    push es
+    push si
+    push bx
+    push dx
+    mov es, [xfer_seg]
+    xor si, si
+.line:
+    call CfgNextLine
+    jc .done
+    mov bx, cfgline
+    cmp byte [bx], '#'
+    je .line
+    mov di, bx
+.f:
+    mov al, [di]
+    test al, al
+    jz .line
+    cmp al, '='
+    je .eq
+    inc di
+    jmp .f
+.eq:
+    mov byte [di], 0
+    inc di
+    mov dx, di
+    mov di, bx
+.lc:
+    mov al, [di]
+    test al, al
+    jz .kd
+    cmp al, 'A'
+    jb .lc2
+    cmp al, 'Z'
+    ja .lc2
+    add al, 32
+    mov [di], al
+.lc2:
+    inc di
+    jmp .lc
+.kd:
+    push si
+    mov si, bx
+    mov di, k_host
+    call StrEqSI_DI
+    je .host
+    mov si, bx
+    mov di, k_color
+    call StrEqSI_DI
+    je .color
+    mov si, bx
+    mov di, k_prompt
+    call StrEqSI_DI
+    je .prompt
+    pop si
+    jmp .line
+.host:
+    mov si, dx
+    mov di, host_name
+    mov cx, 15
+    call CopyN
+    pop si
+    jmp .line
+.color:
+    mov si, dx
+    call HexByte
+    mov [term_color], al
+    pop si
+    jmp .line
+.prompt:
+    mov si, dx
+    mov di, prompt_fmt
+    mov cx, 62
+    call CopyN
+    pop si
+    jmp .line
+.done:
+    pop dx
+    pop bx
+    pop si
+    pop es
+    ret
+
+ApplyColor:                     ; recolour the whole screen with [term_color]
+    pusha
+    push es
+    mov al, [term_color]
+    mov [con_attr], al
+    mov bx, VIDEO
+    mov es, bx
+    xor di, di
+    mov cx, 2000
+.l:
+    mov [es:di+1], al
+    add di, 2
+    loop .l
+    pop es
+    popa
+    ret
+
+SplitFields:                    ; cfgline -> uf[0..4] (':' replaced by NUL)
+    push ax
+    push bx
+    push cx
+    push si
+    mov si, cfgline
+    mov bx, uf
+    mov cx, 5
+.n:
+    mov [bx], si
+    add bx, 2
+.s:
+    mov al, [si]
+    test al, al
+    jz .nx
+    cmp al, ':'
+    je .col
+    inc si
+    jmp .s
+.col:
+    mov byte [si], 0
+    inc si
+.nx:
+    loop .n
+    pop si
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+GetUserLine:                    ; loginname -> fields in cfgline/uf ; CF if unknown user
+    push si
+    push di
+    mov si, k_users
+    call LoadCfg
+    jc .nofile
+    push es
+    mov es, [xfer_seg]
+    xor si, si
+.line:
+    call CfgNextLine
+    jc .nf
+    cmp byte [cfgline], '#'
+    je .line
+    cmp byte [cfgline], 0
+    je .line
+    call SplitFields
+    push si
+    mov si, loginname
+    mov di, [uf]
+    call StrEqSI_DI
+    pop si
+    jne .line
+    pop es
+    clc
+    jmp .out
+.nf:
+    pop es
+.nofile:
+    mov si, loginname
+    mov di, k_root
+    call StrEqSI_DI
+    jne .fail
+    mov si, def_rootline
+    mov di, cfgline
+    call CopyStr
+    call SplitFields
+    clc
+    jmp .out
+.fail:
+    stc
+.out:
+    pop di
+    pop si
+    ret
+
+SetUser:                        ; activates the user described by uf[]
+    push ax
+    push cx
+    push si
+    push di
+    mov si, [uf]
+    mov di, u_name
+    mov cx, 15
+    call CopyN
+    mov byte [u_root], 0
+    mov si, [uf+4]
+    mov di, k_admin
+    call StrEqSI_DI
+    jne .nr
+    mov byte [u_root], 1
+.nr:
+    mov si, [uf+6]
+    mov di, u_run
+    mov cx, 159
+    call CopyN
+    mov si, [uf+8]
+    mov di, u_hide
+    mov cx, 159
+    call CopyN
+    xor ax, ax
+    mov [cwd_clu], ax
+    mov [dir_want], ax
+    mov byte [dir_ok], 0
+    mov byte [cwd_path], '/'
+    mov byte [cwd_path+1], 0
+    pop di
+    pop si
+    pop cx
+    pop ax
+    ret
+
+Delay:                          ; AX = ticks
+    push bx
+    push cx
+    mov cx, ax
+    call GetTicks
+    mov bx, ax
+.l:
+    sti
+    hlt
+    call GetTicks
+    sub ax, bx
+    cmp ax, cx
+    jb .l
+    pop cx
+    pop bx
+    ret
+
+Login:
+.again:
+    mov si, msg_login
+    call Print
+    mov byte [rl_hide], 0
+    call ReadLine
+    jc .again
+    cmp byte [inbuf], 0
+    je .again
+    mov si, inbuf
+    mov di, loginname
+    mov cx, 15
+    call CopyN
+    mov si, msg_pass
+    call Print
+    mov byte [rl_hide], 1
+    call ReadLine
+    mov byte [rl_hide], 0
+    jc .again
+    call GetUserLine
+    jc .bad
+    mov si, inbuf
+    mov di, [uf+2]
+    call StrEqSI_DI
+    jne .bad
+    call SetUser
+    call PrintNL
+    mov si, kl_login
+    call KlogBegin
+    call Print
+    mov si, u_name
+    call Print
+    call KlogEnd
+    ret
+.bad:
+    mov si, msg_badlogin
+    call Print
+    mov ax, 36
+    call Delay
+    jmp .again
+
+relogin:
+    mov sp, 0xFFF0
+    call ClearScreen
+    call Login
+    jmp shell
+
+PrintPrompt:
+    push ax
+    push si
+    mov si, prompt_fmt
+.l:
+    mov al, [si]
+    inc si
+    test al, al
+    jz .d
+    cmp al, '%'
+    je .pc
+.lit:
+    call PutC
+    jmp .l
+.pc:
+    mov al, [si]
+    inc si
+    test al, al
+    jz .d
+    cmp al, 'u'
+    je .u
+    cmp al, 'h'
+    je .h
+    cmp al, 'd'
+    je .dr
+    cmp al, 'p'
+    je .p
+    cmp al, '$'
+    je .dol
+    jmp .lit
+.u:
+    push si
+    mov si, u_name
+    call Print
+    pop si
+    jmp .l
+.h:
+    push si
+    mov si, host_name
+    call Print
+    pop si
+    jmp .l
+.dr:
+    call DriveLetter
+    call PutC
+    jmp .l
+.p:
+    push si
+    mov si, cwd_path
+    call Print
+    pop si
+    jmp .l
+.dol:
+    mov al, '$'
+    cmp byte [u_root], 0
+    je .lit
+    mov al, '#'
+    jmp .lit
+.d:
+    pop si
+    pop ax
+    ret
+
+CheckRun:                       ; abspath (set by GetPath) -> CF=1 if execution is denied
+    push si
+    push di
+    cmp byte [u_root], 0
+    jne .ok
+    cmp byte [u_run], 0
+    je .ok
+    mov si, u_run
+    mov di, abspath
+    call GlobList
+    jc .ok
+    mov si, msg_denied
+    call Print
+    stc
+    jmp .r
+.ok:
+    clc
+.r:
+    pop di
+    pop si
+    ret
+
+cmd_whoami:
+    mov si, u_name
+    call Print
+    mov al, ' '
+    call PutC
+    mov al, '('
+    call PutC
+    mov si, k_user
+    cmp byte [u_root], 0
+    je .p
+    mov si, k_admin
+.p:
+    call Print
+    mov al, ')'
+    call PutC
+    call PrintNL
+    ret
+
+cmd_logout:
+    jmp relogin
+
+cmd_su:
+    cmp byte [si], 0
+    jne .n
+    mov si, k_root
+.n:
+    mov di, loginname
+    mov cx, 15
+    call CopyN
+    call GetUserLine
+    jc .bad
+    cmp byte [u_root], 0
+    jne .go
+    mov si, msg_pass
+    call Print
+    mov byte [rl_hide], 1
+    call ReadLine
+    mov byte [rl_hide], 0
+    jc .bad
+    mov si, inbuf
+    mov di, [uf+2]
+    call StrEqSI_DI
+    jne .bad
+.go:
+    call SetUser
+    ret
+.bad:
+    mov si, msg_badlogin
+    call Print
+    ret
+
+; ------------------------------------------------------------
+; Kernel API for native programs:  int 0x80, AH = function
+;  01 print DS:SI   02 putc AL   03 readline ES:DI,CX max,AL=1 hide
+;  04 getkey        05 write file path DS:SI data ES:DI size CX
+;  06 read file path DS:SI dest ES:DI max CX -> AX   07 colour AL
+;  08 mkdir DS:SI   09 exec command DS:SI   0A file exists -> AX
+;  0B ticks -> AX            (CF = error)
+; ------------------------------------------------------------
+Int80:
+    sti
+    cld
+    mov [cs:api_ds], ds
+    mov [cs:api_es], es
+    mov [cs:api_ax], ax
+    mov [cs:api_bx], bx
+    mov [cs:api_cx], cx
+    mov [cs:api_dx], dx
+    mov [cs:api_si], si
+    mov [cs:api_di], di
+    push cs
+    pop ds
+    mov byte [api_cf], 0
+    mov [api_rax], ax
+    mov [api_rcx], cx
+    mov bl, ah
+    xor bh, bh
+    cmp bx, API_MAX
+    jae .bad
+    shl bx, 1
+    call word [api_table+bx]
+    jmp .ret
+.bad:
+    mov byte [api_cf], 1
+.ret:
+    mov ax, [api_rax]
+    mov cx, [api_rcx]
+    mov bx, [api_bx]
+    mov dx, [api_dx]
+    mov si, [api_si]
+    mov di, [api_di]
+    mov es, [api_es]
+    cmp byte [api_cf], 0
+    mov ds, [api_ds]
+    je .ok
+    stc
+    retf 2
+.ok:
+    clc
+    retf 2
+
+ApiPath:                        ; caller DS:SI asciiz -> apipath
+    push ax
+    push bx
+    push cx
+    push es
+    mov es, [api_ds]
+    mov bx, [api_si]
+    mov di, apipath
+    mov cx, 90
+.l:
+    mov al, [es:bx]
+    test al, al
+    jz .e
+    test cx, cx
+    jz .e
+    mov [di], al
+    inc bx
+    inc di
+    dec cx
+    jmp .l
+.e:
+    mov byte [di], 0
+    pop es
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+api_bad:
+    mov byte [api_cf], 1
+    ret
+
+api_print:
+    push es
+    mov es, [api_ds]
+    mov bx, [api_si]
+.l:
+    mov al, [es:bx]
+    inc bx
+    test al, al
+    jz .d
+    call PutC
+    jmp .l
+.d:
+    pop es
+    ret
+
+api_putc:
+    mov ax, [api_ax]
+    call PutC
+    ret
+
+api_readline:
+    mov al, [api_ax]
+    mov [rl_hide], al
+    call ReadLine
+    pushf
+    mov byte [rl_hide], 0
+    popf
+    jnc .ok
+    mov byte [api_cf], 1
+.ok:
+    push es
+    mov es, [api_es]
+    mov si, inbuf
+    mov di, [api_di]
+    mov cx, [api_cx]
+    xor bx, bx
+.c:
+    test cx, cx
+    jz .e
+    mov al, [si]
+    test al, al
+    jz .e
+    mov [es:di], al
+    inc si
+    inc di
+    inc bx
+    dec cx
+    jmp .c
+.e:
+    mov byte [es:di], 0
+    pop es
+    mov [api_rcx], bx
+    ret
+
+api_getkey:
+    call GetKey
+    mov [api_rax], ax
+    ret
+
+api_wfile:
+    call ApiPath
+    mov si, apipath
+    mov di, fn83
+    call GetPath
+    jc .f
+    mov [dir_want], ax
+    mov ax, [api_es]
+    mov [xfer_seg], ax
+    mov ax, [api_di]
+    mov [xfer_off], ax
+    mov dx, [api_cx]
+    mov si, fn83
+    call SaveFile
+    jc .f
+    ret
+.f:
+    mov byte [api_cf], 1
+    ret
+
+api_rfile:
+    call ApiPath
+    mov si, apipath
+    mov di, fn83
+    call GetPath
+    jc .f
+    mov [dir_want], ax
+    call LoadRoot
+    jc .f
+    mov si, fn83
+    call FindEntry
+    jc .f
+    mov ax, [api_es]
+    mov [xfer_seg], ax
+    mov ax, [api_di]
+    mov [xfer_off], ax
+    mov ax, [api_cx]
+    mov [xfer_max], ax
+    call LoadFile
+    jc .f
+    mov [api_rax], ax
+    ret
+.f:
+    mov byte [api_cf], 1
+    ret
+
+api_color:
+    mov al, [api_ax]
+    mov [term_color], al
+    call ApplyColor
+    ret
+
+api_mkdir:
+    call ApiPath
+    mov si, k_mkdir
+    mov di, cmdbuf
+    call CopyStr
+    mov si, apipath
+    mov di, cmdbuf+6
+    call CopyStr
+    mov si, cmdbuf
+    call ShellBuiltin
+    ret
+
+api_exec:
+    call ApiPath
+    mov si, apipath
+    mov di, cmdbuf
+    call CopyStr
+    mov si, cmdbuf
+    call ShellBuiltin
+    jnc .r
+    mov si, cmdbuf
+    call RunSession
+.r:
+    ret
+
+api_exists:
+    call ApiPath
+    mov word [api_rax], 0
+    mov si, apipath
+    mov di, fn83
+    call GetPath
+    jc .r
+    mov [dir_want], ax
+    call LoadRoot
+    jc .r
+    mov si, fn83
+    call FindEntry
+    jc .r
+    mov word [api_rax], 1
+.r:
+    ret
+
+api_ticks:
+    call GetTicks
+    mov [api_rax], ax
+    ret
+
+; 0C alloc segment -> AX   0D free segment BX   0E list dir: DS:SI path, ES:DI buffer -> CX entries
+; (16 bytes each: 11-byte name, attr, dword size)   0F clear screen
+api_alloc:
+    mov cl, 1
+.l:
+    mov al, cl
+    call TaskPtr
+    cmp byte [bx+TK_STATE], ST_FREE
+    je .got
+    inc cl
+    cmp cl, MAXTASK
+    jb .l
+    mov byte [api_cf], 1
+    ret
+.got:
+    mov byte [bx+TK_STATE], ST_GUI
+    mov byte [bx+TK_FLAGS], 0
+    mov ax, [bx+TK_SEG]
+    mov [api_rax], ax
+    ret
+
+api_free:
+    mov cl, 1
+.l:
+    mov al, cl
+    call TaskPtr
+    cmp byte [bx+TK_STATE], ST_GUI
+    jne .n
+    mov ax, [bx+TK_SEG]
+    cmp ax, [api_bx]
+    jne .n
+    mov byte [bx+TK_STATE], ST_FREE
+    ret
+.n:
+    inc cl
+    cmp cl, MAXTASK
+    jb .l
+    ret
+
+api_list:
+    call ApiPath
+    mov si, apipath
+    call ResolveDirArg
+    jc .f
+    mov [dir_want], ax
+    call LoadRoot
+    jc .f
+    push es
+    mov es, [api_es]
+    mov di, [api_di]
+    mov bx, dirbuf
+    mov cx, [dir_ents]
+    xor dx, dx
+.l:
+    mov al, [bx]
+    test al, al
+    jz .d
+    cmp al, 0xE5
+    je .n
+    cmp al, '.'
+    je .n
+    test byte [bx+11], 0x08
+    jnz .n
+    mov si, bx
+    call IsHidden
+    jc .n
+    cmp dx, 60
+    jae .d
+    push cx
+    mov si, bx
+    mov cx, 11
+.c:
+    mov al, [si]
+    mov [es:di], al
+    inc si
+    inc di
+    loop .c
+    pop cx
+    mov al, [bx+11]
+    mov [es:di], al
+    inc di
+    mov ax, [bx+28]
+    mov [es:di], ax
+    mov ax, [bx+30]
+    mov [es:di+2], ax
+    add di, 4
+    inc dx
+.n:
+    add bx, 32
+    loop .l
+.d:
+    pop es
+    mov [api_rcx], dx
+    ret
+.f:
+    mov byte [api_cf], 1
+    ret
+
+api_cls:
+    call ClearScreen
+    ret
+
+api_table:
+    dw api_bad, api_print, api_putc, api_readline, api_getkey, api_wfile
+    dw api_rfile, api_color, api_mkdir, api_exec, api_exists, api_ticks
+    dw api_alloc, api_free, api_list, api_cls
+
+; ------------------------------------------------------------
+; Boot sequence
+; ------------------------------------------------------------
+CreateDefaults:                 ; used when SETUP.BIN is missing
+    mov si, k_mkdirsys
+    mov di, cmdbuf
+    call CopyStr
+    mov si, cmdbuf
+    call ShellBuiltin
+    mov si, k_sysfg
+    mov bx, def_sys
+    call WriteStr
+    mov si, k_users
+    mov bx, def_users
+    call WriteStr
+    ret
+
+boot_main:
+    mov byte [u_root], 1
+    mov byte [cwd_path], '/'
+    push ds
+    xor ax, ax
+    mov ds, ax
+    mov word [0x200], Int80
+    mov word [0x202], KSEG
+    pop ds
+    mov si, kl_boot
+    call Klog
+    call KlogBegin
+    mov si, kl_mem
+    call Print
+    int 0x12
+    call PrintDec
+    mov si, kl_kb
+    call Print
+    call KlogEnd
+    mov si, kl_con
+    call Klog
+    call KlogBegin
+    mov si, kl_sched
+    call Print
+    mov ax, MAXTASK
+    call PrintDec
+    mov si, kl_sched2
+    call Print
+    call KlogEnd
+    mov si, kl_api
+    call Klog
+    call KlogBegin
+    mov si, kl_disk
+    call Print
+    mov al, [bdrive]
+    call PrintHexB
+    call KlogEnd
+    call MountDrive
+    jnc .mok
+    mov si, kl_nofs
+    call Klog
+    call InitDefaults
+    jmp .nofs
+.mok:
+    call KlogBegin
+    mov si, kl_fs
+    call Print
+    mov ax, [ncl]
+    call PrintDec
+    mov si, kl_fs2
+    call Print
+    mov ax, [rootent]
+    call PrintDec
+    mov si, kl_fs3
+    call Print
+    call KlogEnd
+    call InitDefaults
+    mov si, k_sysfg
+    call LoadCfg
+    jnc .have
+    mov si, kl_first
+    call Klog
+    mov si, k_runsetup
+    mov di, cmdbuf
+    call CopyStr
+    mov si, cmdbuf
+    call ShellBuiltin
+    mov si, k_sysfg
+    call LoadCfg
+    jnc .have
+    mov si, kl_defs
+    call Klog
+    call CreateDefaults
+    mov si, k_sysfg
+    call LoadCfg
+    jc .nocfg
+.have:
+    call ParseSys
+    mov si, kl_cfg
+    call Klog
+.nocfg:
+.nofs:
+    call ApplyColor
+    mov si, kl_ready
+    call Klog
+    call PrintNL
+    call Login
+    call LoadRoot
+    jc near shell
+    mov si, auto_name
+    call FindEntry
+    jc near shell
+    mov si, auto_cmd
+    mov di, cmdbuf
+    call CopyStr
+    mov si, cmdbuf
+    call ShellBuiltin
+    jmp shell
+
+kl_boot     db "SpheraOS 4.0 starting (16-bit real mode kernel)", 0
+kl_mem      db "bios: conventional memory ", 0
+kl_kb       db " KB", 0
+kl_con      db "console: VGA text 80x25, direct VRAM driver", 0
+kl_sched    db "sched: ", 0
+kl_sched2   db " task slots (64 KB each), time-sliced PLB interpreter", 0
+kl_api      db "api: int 0x80 ready (native program services)", 0
+kl_disk     db "disk: boot drive 0x", 0
+kl_nofs     db "fat12: NO FILESYSTEM FOUND - dropping to shell", 0
+kl_fs       db "fat12: mounted, ", 0
+kl_fs2      db " clusters, ", 0
+kl_fs3      db " root entries", 0
+kl_first    db "config: /SYS/SYSTEM.CFG missing - first boot, running SETUP.BIN", 0
+kl_defs     db "config: SETUP.BIN unavailable - writing default configuration", 0
+kl_cfg      db "config: /SYS/SYSTEM.CFG applied", 0
+kl_ready    db "init: kernel ready", 0
+kl_login    db "login: session opened for ", 0
+
+k_host      db "host", 0
+k_color     db "color", 0
+k_prompt    db "prompt", 0
+k_root      db "root", 0
+k_admin     db "admin", 0
+k_user      db "user", 0
+k_users     db "/SYS/USERS.CFG", 0
+k_sysfg     db "/SYS/SYSTEM.CFG", 0
+k_runsetup  db "run /SETUP.BIN", 0
+k_mkdir     db "mkdir ", 0
+k_mkdirsys  db "mkdir /SYS", 0
+def_host    db "sphera", 0
+def_prompt  db "%u@%h %d:%p%$ ", 0
+def_rootline db "root:root:admin::", 0
+def_sys     db "# SpheraOS system configuration", 10
+            db "host=sphera", 10
+            db "color=07", 10
+            db "prompt=%u@%h %d:%p%$ ", 10, 0
+def_users   db "# user:password:role:run-allowed-globs:hidden-globs", 10
+            db "# role = admin or user.  Globs are upper-case absolute paths,", 10
+            db "# e.g.  bob:1234:user:/GAMES/*,/APPS/*:/SECRET/*,/PRIVATE", 10
+            db "root:root:admin::", 10, 0
+msg_login   db "login: ", 0
+msg_pass    db "Password: ", 0
+msg_badlogin db "Login incorrect.", 10, 0
+msg_denied  db "Permission denied.", 10, 0
+n_whoami    db "whoami", 0
+n_su        db "su", 0
+n_logout    db "logout", 0
+
+nop_ret:
+    ret
+
+AbsAppend:                      ; append asciiz SI to abspath
+    push ax
+    push si
+    push di
+    mov di, abspath
+.e:
+    cmp byte [di], 0
+    je .c
+    inc di
+    jmp .e
+.c:
+    mov al, [si]
+    mov [di], al
+    inc si
+    inc di
+    test al, al
+    jnz .c
+    pop di
+    pop si
+    pop ax
+    ret
+
+k_dotplb    db ".PLB", 0
+
 ; ------------------------------------------------------------
 ; End of code. Build fails here if the kernel outgrows 40 KB.
 ; ------------------------------------------------------------
 times 0xA000-($-$$) db 0
 
-; ------------------------------------------------------------
-; BSS (not stored in the file). 0xA000-0xA7FF is cleared at boot.
-; ------------------------------------------------------------
+; ---- BSS (not stored in the file); 0xA000-0xAFFF is cleared at boot ----
 absolute 0xA000
 bss_start:
-bdrive      resb 1
-dir_ok      resb 1
-fat_ok      resb 1
-dop         resb 1
-pr_nl       resb 1
-id_dollar   resb 1
-as_op       resb 1
-as_str      resb 1
-fsck_fix    resb 1
-fmt_all     resb 1
-bgflag      resb 1
-st_slot     resb 1
-wt_slot     resb 1
-wt_ran      resb 1
-ed_mod      resb 1
-bss_pad     resb 1
-cur_task    resw 1
-cur_line    resw 1
-slice_sp    resw 1
-stmt_start  resw 1
-tw_si       resw 1
-for_step    resw 1
-nowt        resw 1
-seed        resw 1
-boot_t      resw 2
-spc         resw 1
-rsvd        resw 1
-nfats       resw 1
-rootent     resw 1
-totsec      resw 1
-spf         resw 1
-spt         resw 1
-heads       resw 1
-root_start  resw 1
-root_secs   resw 1
-data_start  resw 1
-ncl         resw 1
-maxcl       resw 1
-cluster_bytes resw 1
-xfer_seg    resw 1
-xfer_off    resw 1
-xfer_max    resw 1
-lf_size     resw 1
-lf_clu      resw 1
-sf_size     resw 1
-sf_name     resw 1
-sf_ent      resw 1
-sf_prev     resw 1
-sf_first    resw 1
-sf_cur      resw 1
-sf_ptr      resw 1
-sf_left     resw 1
-ls_files    resw 1
-ls_bytes    resw 2
-ls_col      resb 1
-fk_files    resw 1
-fk_err      resw 1
-fk_lost     resw 1
-hd_base     resw 1
-hd_seg      resw 1
-ed_len      resw 1
-ed_cur      resw 1
-ed_top      resw 1
-ed_left     resw 1
-ed_row      resw 1
-ed_col      resw 1
-ed_line     resw 1
-ed_msg      resw 1
-inbuf       resb 128
-cmdbuf      resb 128
-hist        resb 128
-strbuf      resb 260
-printbuf    resb 260
-fbuf        resb 260
-idbuf       resb 12
-idbuf2      resb 12
-fn83        resb 12
-fn83b       resb 12
-numbuf      resb 12
-tmpname     resb 16
-ed_name     resb 12
-ed_nametxt  resb 16
-tasks       resb 192
+bdrive         resb 1
+dir_ok         resb 1
+fat_ok         resb 1
+dop            resb 1
+pr_nl          resb 1
+id_dollar      resb 1
+as_op          resb 1
+as_str         resb 1
+fsck_fix       resb 1
+fmt_all        resb 1
+bgflag         resb 1
+st_slot        resb 1
+wt_slot        resb 1
+wt_ran         resb 1
+ed_mod         resb 1
+bss_pad        resb 1
+cur_task       resw 1
+cur_line       resw 1
+slice_sp       resw 1
+stmt_start     resw 1
+tw_si          resw 1
+for_step       resw 1
+nowt           resw 1
+seed           resw 1
+boot_t         resw 2
+spc            resw 1
+rsvd           resw 1
+nfats          resw 1
+rootent        resw 1
+totsec         resw 1
+spf            resw 1
+spt            resw 1
+heads          resw 1
+root_start     resw 1
+root_secs      resw 1
+data_start     resw 1
+ncl            resw 1
+maxcl          resw 1
+cluster_bytes  resw 1
+xfer_seg       resw 1
+xfer_off       resw 1
+xfer_max       resw 1
+lf_size        resw 1
+lf_clu         resw 1
+sf_size        resw 1
+sf_name        resw 1
+sf_ent         resw 1
+sf_prev        resw 1
+sf_first       resw 1
+sf_cur         resw 1
+sf_ptr         resw 1
+sf_left        resw 1
+ls_files       resw 1
+ls_bytes       resw 2
+fk_files       resw 1
+fk_err         resw 1
+fk_lost        resw 1
+hd_base        resw 1
+hd_seg         resw 1
+ed_len         resw 1
+ed_cur         resw 1
+ed_top         resw 1
+ed_left        resw 1
+ed_row         resw 1
+ed_col         resw 1
+ed_line        resw 1
+ed_msg         resw 1
+inbuf          resb 128
+cmdbuf         resb 128
+hist           resb 128
+strbuf         resb 260
+printbuf       resb 260
+fbuf           resb 260
+idbuf          resb 12
+idbuf2         resb 12
+fn83           resb 12
+fn83b          resb 12
+numbuf         resb 12
+tmpname        resb 16
+ed_name        resb 12
+ed_nametxt     resb 16
+tasks          resb 192
+con_row        resb 1
+con_col        resb 1
+con_attr       resb 1
+log_on         resb 1
+log_len        resw 1
+dir_want       resw 1
+dir_cur        resw 1
+dir_secs       resw 1
+dir_ents       resw 1
+ld_clu         resw 1
+cwd_clu        resw 1
+gp_dir         resw 1
+gp_dest        resw 1
+gp_si          resw 1
+gp_err         resb 1
+mk_clu         resw 1
+mk_par         resw 1
+mk_n           resw 1
+cp_dsrc        resw 1
+cp_ddst        resw 1
+fk_n           resw 1
+fk_i           resw 1
+ed_dir         resw 1
+ws_data        resw 1
+api_ds         resw 1
+api_es         resw 1
+api_ax         resw 1
+api_bx         resw 1
+api_cx         resw 1
+api_dx         resw 1
+api_si         resw 1
+api_di         resw 1
+api_rax        resw 1
+api_rcx        resw 1
+api_cf         resb 1
+u_root         resb 1
+u_save         resb 1
+rl_hide        resb 1
+term_color     resb 1
+uf             resw 5
+fk_list        resb 256
+abspath        resb 64
+cwd_path       resb 64
+ls_path        resb 64
+comptmp        resb 16
+pathtmp        resb 80
+gp_name        resb 12
+hidtmp         resb 80
+globtmp        resb 64
+apipath        resb 96
+cfgline        resb 130
+loginname      resb 16
+u_name         resb 16
+host_name      resb 16
+prompt_fmt     resb 64
+u_run          resb 160
+u_hide         resb 160
 bss_small_end:
 
-; DAP и буфер LBA для int 13h AH=42/43
-dap:        resb 16
-dap_cnt:    equ dap+2      ; dw
-dap_off:    equ dap+4      ; dw
-dap_seg:    equ dap+6      ; dw
-dap_lba:    equ dap+8      ; dq
-io_lba:     resw 1
-part_base:  resw 1
-scan_drv:   resb 1
-scan_cx:    resw 1
-scan_dx:    resw 1
-new_drv:    resb 1
-old_drv:    resb 1
-fmt_drv:    resb 1
-fmt_old:    resb 1
-
-absolute 0xA800
+absolute 0xB000
 dirbuf      resb 7168
-fatbuf      resb 6144
+fatbuf      resb 4608
 secbuf      resb 512
+klog        resb 2048
 fsck_map    resb 512
