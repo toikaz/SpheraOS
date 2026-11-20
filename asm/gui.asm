@@ -380,6 +380,8 @@ files_key:
     je .dn
     cmp ah, 0x1C                ; Enter
     je near open_sel
+    cmp ah, 0x0E                ; Backspace: one folder up
+    je .bkup
     ret
 .up:
     mov si, [focus]
@@ -398,6 +400,12 @@ files_key:
     jae .r
     inc word [si+W_SEL]
     ret
+.bkup:
+    cmp word [cur_dir], 0
+    je .r
+    mov si, [focus]
+    mov word [si+W_SEL], 0
+    jmp open_sel
 
 set_key:                        ; Setup window: SI = window
     cmp ah, 0x48
@@ -460,16 +468,16 @@ wmode_start:                    ; AL = 1 move, 2 size
 
 wmode_key:
     cmp ah, 0x01
-    je .end
+    je near .end
     cmp ah, 0x1C
-    je .end
+    je near .end
     cmp ah, 0x40
-    je .end
+    je near .end
     cmp ah, 0x41
-    je .end
+    je near .end
     mov si, [focus]
     test si, si
-    jz .end
+    jz near .end
     xor bx, bx
     xor cx, cx
     cmp ah, 0x4B
@@ -748,6 +756,12 @@ focus_next:
 win_title:
     push bx
     movzx bx, byte [si+W_TYPE]
+    cmp bx, T_FILES
+    jne .wt_app
+    pop bx
+    mov si, path_buf
+    ret
+.wt_app:
     cmp bx, T_APP
     je .app
     shl bx, 1
@@ -1121,8 +1135,14 @@ c_files:
     mov dl, [fcol]
     call draw_str
 
+    test byte [di+11], 0x10
+    jz .fsz
+    mov si, s_dirtag
+    jmp .fsz2
+.fsz:
     mov ax, [di+28]
     call num_str
+.fsz2:
     mov bx, [wx]
     add bx, 80
     mov cx, [fy]
@@ -1752,7 +1772,7 @@ note_key:                       ; AH = scan, AL = ascii, SI = Notes window
     cmp ah, 0x4B
     jne .a1
     cmp word [note_cur], FBUF
-    jbe .done
+    jbe near .done
     dec word [note_cur]
     jmp .done
 .a1:
@@ -1760,7 +1780,7 @@ note_key:                       ; AH = scan, AL = ascii, SI = Notes window
     jne .a2
     mov bx, [note_cur]
     cmp bx, [fend]
-    jae .done
+    jae near .done
     inc word [note_cur]
     jmp .done
 .a2:
@@ -2244,6 +2264,8 @@ hexd:
 ;  FAT12
 ; ============================================================
 mount:
+    mov word [cur_dir], 0
+    mov word [dir_max], 224
     mov byte [diskerr], 0
     mov byte [can_write], 0
     mov word [spt], 18
@@ -2336,10 +2358,7 @@ reload_caches:                  ; re-read FAT and root dir from disk
     mov cx, [spf]
     mov bx, FAT_BUF
     call read_run
-    mov ax, [root_lba]
-    mov cx, [root_secs]
-    mov bx, ROOT_BUF
-    call read_run
+    call load_view
     ret
 
 read_run:                       ; AX = LBA, CX = count, BX = dest offset
@@ -2578,7 +2597,7 @@ find_name:
     mov [fn_name], si
     xor dx, dx
 .l:
-    cmp dx, 224
+    cmp dx, [dir_max]
     jae near .nf
     mov ax, dx
     shl ax, 5
@@ -2734,7 +2753,53 @@ flush_fat:                      ; write every FAT copy. CF=1 on error
     stc
     ret
 
-flush_root:                     ; write the root directory. CF=1 on error
+flush_root:                     ; write the folder in view (root or a sub folder). CF=1 on error
+    cmp word [cur_dir], 0
+    je .root
+    mov ax, [cur_dir]           ; sub folder: walk its cluster chain
+    mov [fd_clu], ax
+    mov ax, [view_got]
+    shr ax, 9
+    mov [fd_secs], ax
+    mov si, ROOT_BUF
+.dc:
+    cmp word [fd_secs], 0
+    je .dok
+    mov ax, [fd_clu]
+    cmp ax, 2
+    jb .derr
+    cmp ax, 0xFF8
+    jae .derr
+    sub ax, 2
+    mov cx, [spc]
+    mul cx
+    add ax, [data_lba]
+    mov [fd_lba], ax
+    mov cx, [spc]
+.dsec:
+    cmp word [fd_secs], 0
+    je .dnext
+    push cx
+    call copy_to_bounce
+    mov ax, [fd_lba]
+    call disk_write
+    pop cx
+    jc .derr
+    inc word [fd_lba]
+    dec word [fd_secs]
+    loop .dsec
+.dnext:
+    mov ax, [fd_clu]
+    call fat_next
+    mov [fd_clu], ax
+    jmp .dc
+.dok:
+    clc
+    ret
+.derr:
+    stc
+    ret
+.root:
     mov ax, [root_lba]
     mov [ff_lba], ax
     mov word [ff_i], 0
@@ -2764,7 +2829,7 @@ get_fat_time:                   ; -> AX = FAT time, DX = FAT date
     mov word [ft_date], 0x0021  ; 1980-01-01 if the RTC fails
     mov ah, 0x02
     int 0x1A
-    jc .d
+    jc near .d
     mov [ft_h], ch
     mov [ft_m], cl
     mov [ft_s], dh
@@ -2997,7 +3062,7 @@ walk_init:
 next_valid:                     ; DI = next valid entry, CF=1 at the end
 .n:
     mov ax, [fe]
-    cmp ax, 224
+    cmp ax, [dir_max]
     jae .eof
     shl ax, 5
     add ax, ROOT_BUF
@@ -3013,6 +3078,11 @@ next_valid:                     ; DI = next valid entry, CF=1 at the end
     je .n
     test al, 0x08
     jnz .n
+    cmp byte [di], '.'
+    jne .show
+    cmp byte [di+1], ' '
+    je .n
+.show:
     inc word [nvis]
     clc
     ret
@@ -3044,8 +3114,126 @@ dir_count:                      ; -> AX = number of entries
     mov ax, [nvis]
     ret
 
-; Enter in Files: *.APP starts a program, other files open in Notes
+; ---- folders ---------------------------------------------------
+; load_view: read the folder cur_dir (0 = root) into ROOT_BUF
+load_view:
+    cmp word [cur_dir], 0
+    jne .sub
+    mov ax, [root_lba]
+    mov cx, [root_secs]
+    mov bx, ROOT_BUF
+    call read_run
+    mov word [dir_max], 224
+    ret
+.sub:
+    push es
+    mov ax, cs
+    mov es, ax
+    mov di, ROOT_BUF            ; entries past the end of the folder must read as empty
+    mov cx, 3584
+    xor ax, ax
+    cld
+    rep stosw
+    pop es
+    mov ax, cs
+    mov [dseg], ax
+    mov word [doff], ROOT_BUF
+    mov word [dlimit], ROOT_BUF+7168
+    mov word [lf_size], 7168
+    mov ax, [cur_dir]
+    mov [lf_clu], ax
+    call load_chain
+    jc .fail
+    mov ax, [got]
+    mov [view_got], ax
+    shr ax, 5
+    jnz .n
+    mov ax, 1
+.n:
+    mov [dir_max], ax
+    ret
+.fail:
+    mov word [cur_dir], 0
+    jmp load_view
+
+; enter_dir: DI = folder entry ('..' goes up). Updates the path and loads the folder.
+enter_dir:
+    mov ax, [di+26]
+    push ax
+    cmp byte [di], '.'
+    jne .push
+    cmp byte [di+1], '.'
+    jne .push
+    call path_pop
+    jmp .go
+.push:
+    call path_add
+.go:
+    pop ax
+    mov [cur_dir], ax
+    call load_view
+    mov si, [focus]
+    mov word [si+W_SEL], 0
+    ret
+
+; path_add: DI = entry; appends "/NAME" to path_buf
+path_add:
+    mov bx, path_buf
+.f:
+    cmp byte [bx], 0
+    je .got
+    inc bx
+    jmp .f
+.got:
+    cmp bx, path_buf+56
+    jae .done
+    mov byte [bx], '/'
+    inc bx
+    mov si, di
+    mov cx, 8
+.c:
+    mov al, [si]
+    cmp al, ' '
+    je .end
+    mov [bx], al
+    inc bx
+    inc si
+    loop .c
+.end:
+    mov byte [bx], 0
+.done:
+    ret
+
+; path_pop: removes the last "/NAME" from path_buf
+path_pop:
+    mov bx, path_buf
+    xor si, si
+.f:
+    mov al, [bx]
+    test al, al
+    jz .end
+    cmp al, '/'
+    jne .n
+    mov si, bx
+.n:
+    inc bx
+    jmp .f
+.end:
+    test si, si
+    jz .r
+    mov byte [si], 0
+.r:
+    ret
+
+; Enter in Files: folders open, *.APP starts a program, other files open in Notes
 open_sel:
+    mov si, [focus]
+    mov ax, [si+W_SEL]
+    call find_entry
+    jc near .r
+    test byte [di+11], 0x10
+    jnz near enter_dir
+    mov ax, [di+26]
     mov si, [focus]
     mov ax, [si+W_SEL]
     call find_entry
@@ -3621,7 +3809,7 @@ s_hint1   db "F1 Files F2 Clock F3 Tasks F4 Notes F8 Setup", 0
 s_hint2   db "F5 max F6 move F7 size Tab focus F10 close Esc exit", 0
 s_name    db "Name", 0
 s_size    db "Size", 0
-s_enter   db "Enter=open  .APP=run", 0
+s_enter   db "Enter=open Bksp=up", 0
 s_win     db "Window", 0
 s_ticks   db "Ticks", 0
 s_empty   db "(empty - type, or open a file in Files)", 0
@@ -3662,6 +3850,15 @@ cfg_name  db "GUI     CFG"
 ; ============================================================
 ;  5x7 font, ASCII 32..126, 5 columns per glyph (bit 0 = top row)
 ; ============================================================
+cur_dir    dw 0                ; folder in view (0 = root)
+dir_max    dw 224              ; entries in the folder in view
+view_got   dw 0                ; bytes of the folder in view
+fd_clu     dw 0
+fd_secs    dw 0
+fd_lba     dw 0
+path_buf   db "Files", 0
+           times 58 db 0
+s_dirtag   db "<DIR>", 0
 font5x7:
     db 0x00,0x00,0x00,0x00,0x00 ; space
     db 0x00,0x00,0x5F,0x00,0x00 ; !
