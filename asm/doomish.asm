@@ -188,7 +188,7 @@ initlevel:
     cmp byte [fresh], 0
     je .keep
     mov word [hp], 100
-    mov word [ammo], 60
+    mov word [ammo], 120
     mov byte [fresh], 0
 .keep:
     mov di, keys
